@@ -1,6 +1,6 @@
 {
   "name": "handover",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "hsd plugin to resolve names on other networks like ENS and Namecoin",
   "main": "lib/handover.js",
   "scripts": {
@@ -30,7 +30,7 @@
     "ethers": "^5.0.31"
   },
   "peerDependencies": {
-    "hsd": "~3.0.1",
+    "hsd": "~4.0.1",
     "bns": "~0.15.0",
     "blru": "~0.1.6"
   },
