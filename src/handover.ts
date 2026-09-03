@@ -108,9 +108,11 @@ class Plugin {
           }, name, wire.types.NS, tld)
         : originalRes;
 
-      // No NS records: we're done, the plugin is bypassed.
+      // No NS records: we're done, the plugin is bypassed. For the
+      // synthetic DS->NS rewrite, send the original DS response instead of
+      // an NS-typed message to a DS question (HIP-5: no bare NS referrals).
       if (!res.authority.length) {
-        return res;
+        return type === wire.types.DS && labels.length === 1 ? originalRes : res;
       }
 
       let hip5Referral = false;
