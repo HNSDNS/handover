@@ -1,13 +1,8 @@
-/*!
- * handover.js - External-network resolver plugin for hsd
- * Copyright (c) 2021 Matthew Zipkin (MIT License).
- */
+import bns from 'bns';
+import { BufferReader } from 'bufio';
+import Ethereum from './ethereum.ts';
 
-'use strict';
-
-const {wire, util} = require('bns');
-const {BufferReader} = require('bufio');
-const Ethereum = require('./ethereum');
+const { wire, util } = bns;
 
 const TYPE_MAP_EMPTY = Buffer.from('0006000000000003', 'hex');
 const TYPE_MAP_ALL = [
@@ -19,39 +14,53 @@ const TYPE_MAP_ALL = [
   wire.types.SPF, wire.types.URI, wire.types.CAA
 ];
 
-const plugin = exports;
+interface HsdNode {
+  ns: any;
+  logger: any;
+  config: any;
+  chain: any;
+}
+
+interface HsdQuestion {
+  name: string;
+  type: number;
+}
 
 class Plugin {
-  constructor(node) {
-    this.ready = false;
+  ready = false;
+  node: HsdNode;
+  ns: any;
+  logger: any;
+  ethereum: Ethereum;
+
+  constructor(node: HsdNode) {
     this.node = node;
     this.ns = node.ns;
     this.logger = node.logger.context('handover');
 
     this.ethereum = new Ethereum({
-      projectId: node.config.str('handover-infura-projectid'),
-      projectSecret: node.config.str('handover-infura-projectsecret')
+      rpcUrl: node.config.str('handover-rpc-url')
     });
 
-    // Plugin can not operate if root server isn't enabled
-    if (!this.ns)
+    // The plugin cannot operate if the root server isn't enabled
+    if (!this.ns) {
       return;
+    }
 
-    // Middleware function that intercepts queries to root
-    // before cache, blocklist or HNS lookup
-    this.ns.middle = async (tld, req) => {
-      // To avoid poisoning recursive cache
-      // wait until plugin is ready
+    // Middleware intercepting queries to the root before cache,
+    // blocklist, or HNS lookup
+    this.ns.middle = async (tld: string, req: any) => {
+      // Answer only once ready, to avoid poisoning recursive caches
       if (!this.ready) {
         const res = new wire.Message();
         res.code = wire.codes.REFUSED;
         return res;
       }
-      
-      // important not lowercased by hsd
+
+      // hsd does not lowercase the TLD for us
       tld = tld.toLowerCase();
-      
-      const [qs] = req.question;
+
+      const [qs]: HsdQuestion[] = req.question;
       const name = qs.name.toLowerCase();
       const type = qs.type;
       const labels = util.split(name);
@@ -70,11 +79,11 @@ class Plugin {
 
           try {
             data = await this.ethereum.resolveDnsFromEns(name, type);
-            if (data && data.length > 0)
+            if (data && data.length > 0) {
               return this.sendData(data, type);
+            }
           } catch (e) {
-            this.logger.warning('Resolution failed for name: %s', name);
-            this.logger.debug(e.stack);
+            this.logResolutionFailure(e, name);
           }
 
           return this.sendSOA(name, tld, type);
@@ -85,32 +94,34 @@ class Plugin {
       // Next, try actually resolving the name with the HNS root zone.
       // We are going to examine the result before sending it back.
       const originalRes = await this.resolveHNS(req, name, type, tld);
-      let res = null;
 
       // Special DS processing if the request is "<hip-5 tld> DS"
       // handover won't find any referral in the answer
-      // it won't recognize it as a HIP5 name which results 
+      // it won't recognize it as a HIP5 name which results
       // in a bad proof "NS RRSIG NSEC". Need to manually
       // request "<hip-5 tld> NS" for handover to process it.
-      if (type === wire.types.DS && labels.length === 1) {
-          res = await this.resolveHNS({
+      const res = type === wire.types.DS && labels.length === 1
+        ? await this.resolveHNS({
             question: [
               new wire.Question(name, wire.types.NS)
             ]
-          }, name, wire.types.NS, tld);
-      } else {
-          res = originalRes;
+          }, name, wire.types.NS, tld)
+        : originalRes;
+
+      // No NS records: we're done, the plugin is bypassed. For the
+      // synthetic DS->NS rewrite, send the original DS response instead of
+      // an NS-typed message to a DS question (HIP-5: no bare NS referrals).
+      if (!res.authority.length) {
+        return type === wire.types.DS && labels.length === 1 ? originalRes : res;
       }
 
-      // If there's no NS records, we're done, plugin is bypassed.
-      if (!res.authority.length)
-        return res;
-
       let hip5Referral = false;
+
       // Check NS records for HIP-5 referrals
       for (const rr of res.authority) {
-        if (rr.type !== wire.types.NS)
+        if (rr.type !== wire.types.NS) {
           continue;
+        }
 
         const ending = util.label(rr.data.ns, util.split(rr.data.ns), -1);
 
@@ -120,7 +131,7 @@ class Plugin {
           hip5Referral = true;
 
           // If the recursive is being minimal, don't look up the name.
-          // Send the SOA back and get the full query from the recursive .
+          // Send the SOA back and get the full query from the recursive.
           if (labels.length < 2) {
             return this.sendSOA(name, tld, type);
           }
@@ -153,8 +164,7 @@ class Plugin {
                 break;
             }
           } catch (e) {
-            this.logger.warning('Resolution failed for name: %s', name);
-            this.logger.debug(e.stack);
+            this.logResolutionFailure(e, name);
           }
         }
       }
@@ -181,36 +191,43 @@ class Plugin {
   async open() {
     this.logger.info('handover external network resolver plugin installed.');
 
-    // The first thing this plugin wants to do when it's opened is
-    // contact https://mainnet.infura.io/. Of course, if this instance
-    // of hsd is being used to resolve DNS for the system it is running on,
-    // that is not yet possible at this point in the hsd life cycle!
-    // The best we can do is wait for the node to fully sync so
-    // we can properly resolve names.
+    // The plugin wants to contact the local Ethereum client (Helios) right
+    // when it's opened, but if this hsd instance resolves DNS for the system
+    // it runs on, the client may not be reachable yet this early in the hsd
+    // life cycle. Wait for the node to fully sync before activating.
     if (this.node.chain.isFull()) {
-      await this.ethereum.init();
-      this.ready = true;
-      this.logger.info(
-        'handover external network resolver plugin is active!'
-      );
+      await this.activate();
     }
 
-    this.node.chain.on('full', async () => {
-      await this.ethereum.init();
-      this.ready = true;
-      this.logger.info(
-        'handover external network resolver plugin is active!'
-      );
+    this.node.chain.on('full', () => {
+      return this.activate();
     });
+  }
+
+  // Initialize the Ethereum client and start answering queries. Safe to call
+  // multiple times (init re-fetches the resolver).
+  async activate() {
+    await this.ethereum.init();
+    this.ready = true;
+    this.logger.info(
+      'handover external network resolver plugin is active!'
+    );
+  }
+
+  // Both middleware lookup paths log failures the same way.
+  logResolutionFailure(e: unknown, name: string) {
+    this.logger.warning('Resolution failed for name: %s', name);
+    this.logger.debug((e as Error).stack);
   }
 
   close() {
     this.ready = false;
   }
 
-  // Copy hsd's server.resolve() to lookup a name on HNS normally
-  async resolveHNS(req, name, type, tld) {
+  // Mirrors hsd's server.resolve(): look up a name on HNS normally.
+  async resolveHNS(req: any, name: string, type: number, tld: string) {
     let res = null;
+
     // Check the root resolver cache first
     const cache = this.ns.cache.get(name, type);
 
@@ -219,14 +236,16 @@ class Plugin {
     } else {
       res = await this.ns.response(req);
       // Cache responses
-      if (!util.equal(tld, '_synth.'))
+      if (!util.equal(tld, '_synth.')) {
         this.ns.cache.set(name, type, res);
+      }
     }
+
     return res;
   }
 
-  //  send SOA-only when we don't have / don't want to answer.
-  async sendSOA(name, tld, type) {
+  // SOA-only reply when we have no answer or don't want to give one.
+  async sendSOA(name: string, tld: string, type: number) {
     const res = new wire.Message();
     res.aa = true;
     const nsec = this.toNSEC(name);
@@ -251,32 +270,35 @@ class Plugin {
     return res;
   }
 
-  toNSEC(name) {
+  toNSEC(name: string) {
     const rr = new wire.Record();
     const rd = new wire.NSECRecord();
     rr.name = util.fqdn(name);
     rr.type = wire.types.NSEC;
     rr.ttl = 36 * 10 * 60;
 
-    rd.nextDomain = util.fqdn("\\000." + name);
+    rd.nextDomain = util.fqdn('\\000.' + name);
     rr.data = rd;
 
     return rr;
   }
 
   // Convert a wire-format DNS record to a message and send.
-  sendData(data, type) {
+  sendData(data: Buffer, type: number) {
     const res = new wire.Message();
     res.aa = true;
     const br = new BufferReader(data);
+
     while (br.left() > 0) {
       const rr = wire.Record.read(br);
-      if (rr.type === wire.types.NS)
+
+      if (rr.type === wire.types.NS) {
         res.authority.push(rr);
-      else if (rr.type === type || rr.type === wire.types.CNAME)
+      } else if (rr.type === type || rr.type === wire.types.CNAME) {
         res.answer.push(rr);
-      else
+      } else {
         res.authority.push(rr);
+      }
     }
 
     // Referral answer
@@ -289,14 +311,16 @@ class Plugin {
     // from the HNS root zone.
     this.ns.signRRSet(res.answer, type);
 
-    if (type !== wire.types.CNAME)
+    if (type !== wire.types.CNAME) {
       this.ns.signRRSet(res.answer, wire.types.CNAME);
+    }
 
     return res;
   }
 }
 
-plugin.id = 'handover';
-plugin.init = function init(node) {
+export const id = 'handover';
+
+export function init(node: HsdNode): Plugin {
   return new Plugin(node);
-};
+}
