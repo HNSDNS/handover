@@ -1,10 +1,14 @@
 {
   "name": "handover",
-  "version": "1.0.1",
+  "version": "2.0.0",
   "description": "hsd plugin to resolve names on other networks like ENS and Namecoin",
-  "main": "lib/handover.js",
+  "type": "module",
+  "main": "src/handover.ts",
   "scripts": {
-    "test": "bmocha --reporter spec test/*.js"
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:live": "HANDOVER_RPC_URL=http://127.0.0.1:8545 vitest run",
+    "typecheck": "tsc --noEmit"
   },
   "repository": {
     "type": "git",
@@ -16,8 +20,8 @@
     "Ethereum",
     "ETH",
     "ENS",
-    "Namecoin",
-    "NMC"
+    "NMC",
+    "Helios"
   ],
   "author": "Matthew Zipkin",
   "license": "MIT",
@@ -25,16 +29,24 @@
     "url": "https://github.com/imperviousinc/handover/issues"
   },
   "homepage": "https://github.com/imperviousinc/handover#readme",
+  "engines": {
+    "node": ">=24"
+  },
   "dependencies": {
-    "bufio": "^1.0.7",
-    "ethers": "^5.0.31"
+    "viem": "^2.56.3"
   },
   "peerDependencies": {
-    "hsd": "~7.0.1",
+    "blru": "~0.1.8",
     "bns": "~0.15.0",
-    "blru": "~0.1.6"
+    "bufio": "~1.2.3",
+    "hsd": "^8.0.0"
   },
   "devDependencies": {
-    "bmocha": "^2.1.5"
+    "@types/node": "^24.0.0",
+    "blru": "~0.1.8",
+    "bns": "~0.15.0",
+    "bufio": "~1.2.3",
+    "typescript": "^5.9.3",
+    "vitest": "^4.1.11"
   }
 }
