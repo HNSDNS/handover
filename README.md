@@ -1,57 +1,83 @@
 # Handover
 
-A plugin for `hsd` to enable DNS resolution on external networks like Ethererum.
+A plugin for `hsd` (Handshake full node, v8+) that enables DNS resolution on
+external networks like Ethereum (ENS / EIP-1185).
+
+## Requirements
+
+- **Node.js >= 24** (native ESM + TypeScript type stripping — no build step)
+- **hsd ^8.0.0** (loaded as a plugin)
+- **Helios** (or any Ethereum JSON-RPC endpoint that supports `eth_call`)
+
+## Architecture
+
+Handover no longer talks to a hosted JSON-RPC provider directly. Instead it
+points at a **local Helios light client** (`http://127.0.0.1:8545`), which wraps
+an upstream RPC and verifies responses trustlessly against the consensus layer:
+
+```
+hsd --plugins handover ──► Handover ──► http://127.0.0.1:8545 (Helios)
+                                            │  light-client verification
+                                            ▼
+                                    upstream RPC (e.g. Alchemy/Infura)
+```
+
+Running Helios as a **separate process** (not embedded) keeps the hsd plugin
+small and lets you reuse a single verified RPC endpoint across dapps.
 
 ## Installation & Usage
 
-Before installing, you need an Infura API key. Go to infura.io, create a new
-project and get a free API key. The plugin requires master branch of `hsd`
-(currently unreleased). 
+Install and run Helios first:
+
+```
+curl https://raw.githubusercontent.com/a16z/helios/master/heliosup/install | bash
+heliosup
+helios ethereum --execution-rpc $ETH_RPC_URL
+```
+
+Helios now serves a verified local RPC at `http://127.0.0.1:8545`.
+
+Install the plugin into hsd:
 
 ```
 cd /path/to/hsd
 
-# install the plugin
 npm install imperviousinc/handover
 ```
 
-Your Infura credentials can be passed to the plugin in the same way(s) as all
-other `hsd` configuraiton parameters:
+Tell the plugin where your Helios / RPC endpoint lives (config params work like
+any other hsd option):
 
 Command line:
 
 ```
 hsd \
  --plugins=handover \
- --handover-infura-projectid=<...> \
- --handover-infura-projectsecret=<...>
-``` 
+ --handover-rpc-url=http://127.0.0.1:8545
+```
 
-Environment variables:
+Environment variable:
 
 ```
-export HSD_HANDOVER_INFURA_PROJECTID=<...>
-export HSD_HANDOVER_INFURA_PROJECTSECRET=<...>
+export HSD_HANDOVER_RPC_URL=http://127.0.0.1:8545
 hsd --plugins handover
 ```
 
-Configuration file:
-
-`~/.hsd/hsd.conf`:
+Configuration file (`~/.hsd/hsd.conf`):
 
 ```
-handover-infura-projectid: <...>
-handover-infura-projectsecret: <...>
+handover-rpc-url: http://127.0.0.1:8545
 plugins: handover
 ```
 
 You should see this in the log:
 
 ```
-[info] (handover) handover external network resolver plugin is active.
+[info] (handover) handover external network resolver plugin is active!
 ```
 
-Try it out!
+> **Upgrading hsd?** If coming from an earlier major, pass `--chain-migrate=4`
+> and `--wallet-migrate=7` the first time you run v8.
 
 Resolve an ENS name directly without Handshake:
 
@@ -88,15 +114,7 @@ $ hsd-rpc getnameresource badass
 
 The `_eth` TLD indicates an abstract (forked) ENS contract on Ethereum, appended
 to the contract's address. On Ethereum, the domain `certified.badass` was registered
-with this contract, and its DNS records were set using [EIP-1185](https://eips.ethereum.org/EIPS/eip-1185):
-
-```
-$ node
-
-> const {wire} = require('bns')
-> wire.Record.fromJSON({name:'certified.badass.', ttl: 60000, class: 'IN', type: 'A', data: {address: '184.73.82.1'}}).encode().toString('hex')
-'096365727469666965640662616461737300000100010000ea600004b8495201'
-```
+with this contract, and its DNS records were set using [EIP-1185](https://eips.ethereum.org/EIPS/eip-1185).
 
 ## Explanation
 
@@ -110,43 +128,20 @@ by the plugin before being returned. If a domain has an NS record rooted in eith
 to resolve the user's request on Ethereum. If an answer is found there, it is
 sent back to the recursive resolver.
 
-There is one more complication which is that recursive resolvers (like unbound)
-may have `qname-minimisation` set, which means the resolver begins its recursion
-by ONLY querying the TLD (as opposed to sending the full query string). To deal
-with this, if the plugin detects a NS pointing to `.eth` or `._eth` but does
-not have a full query string (i.e. only one label, `.badass`) the plugin returns
-an empty response with SOA. This tricks the recursive resolver into making a new
+One more complication: recursive resolvers (like unbound) may have
+`qname-minimisation` set, so they begin recursion by querying only the TLD
+rather than sending the full query string. To deal with this, if the plugin
+detects a NS pointing to `.eth` or `._eth` but does not have a full query string
+(i.e. only one label, `.badass`) the plugin returns an empty response with SOA. This tricks the recursive resolver into making a new
 request with the full query string (i.e. `certified.badass`).
-
-## Future Work
-
-There's still a lot "TODO":
-
-Local Ethereum provider: Currently the plugin relies on the Infura API. However,
-it is trivial to add an option to use a local Ethereum full node instead.
-
-Additional ENS types: This plugin currently only supports resolving of EIP-1185
-data (aka "actual DNS records on ENS") but ENS itself has support for many
-abstract data types like [content hashes](https://eips.ethereum.org/EIPS/eip-1577)
-and a special type of [text record](https://eips.ethereum.org/EIPS/eip-634) that
-requires a key to resolve. An example of a set of these text records with their keys:
-
-```
-brantly.eth          avatar               https://i.imgur.com/JcZESMp.png
-brantly.eth          description          "If anyone would come after me, let him deny himself and take up his cross daily and follow me. For whoever would save his life will lose it, but whoever loses his life for my sake will save it. For what does it profit a man if he gains the whole world and loses or forfeits himself?" - Jesus, Luke 9.23-25
-brantly.eth          email                me@brantly.xyz
-brantly.eth          keywords             catholic, ens, oregon, seinfeld, books
-brantly.eth          notice               Not for sale
-brantly.eth          url                  http://brantly.xyz/
-```
-
-Subdomains: The plugin has not been tested on sub domains of names registered
-at the ENS contract root (e.g. `whynot.fuckingfucker.eth` or `yesiam.certified.badass`).
 
 ## Development
 
-To contribute or modify this plugin you can install it in a different working
-directory with git, but it must be linked into hsd correctly to work:
+The plugin is authored in TypeScript and runs directly on Node 24 via native
+type stripping — no build step. ESM-only; hsd loads it through `require()`
+(`require(esm)`), which is supported on Node >= 22.12.
+
+To install it into hsd for development (symlink):
 
 ```
 git clone https://github.com/imperviousinc/handover
@@ -154,10 +149,9 @@ cd handover
 npm install
 
 cd /path/to/hsd/repo
-ln -s /path/to/handover /node_modules
+ln -s /path/to/handover /node_modules/handover
 
 export NODE_PRESERVE_SYMLINKS=1
-
 hsd --plugins handover
 ```
 
@@ -170,19 +164,32 @@ sudo -E hsd --plugins handover --rs-port 53
 
 ## Testing
 
-Run unit tests: `npm run test`
+Unit / plugin-load tests (offline, mocked Ethereum JSON-RPC):
 
-Run integration test:
+```
+npm test
+npm run typecheck
+```
+
+Live tests talk to a real chain. Point them at your local Helios (or any node):
+
+```
+helios ethereum --execution-rpc $ETH_RPC_URL
+HANDOVER_RPC_URL=http://127.0.0.1:8545 npm run test:live
+```
+
+Run the full hsd integration test (requires hsd installed alongside):
 
 ```
 cd /path/to/hsd
-
 node_modules/handover/test/handover-plugin-test.sh
 ```
 
 ## Credit
 
-This plugin relies on the [ethers.js](https://github.com/ethers-io/ethers.js/) library.
+This plugin relies on the [viem](https://viem.sh) library (the low-level engine
+behind the [wagmi](https://wagmi.sh) stack), and the
+[Helios](https://github.com/a16z/helios) Ethereum light client.
 
 Inspiration comes from [hsd-ens-resolution](https://github.com/tynes/hsd-ens-resolution)
 by the very handsome and super-friendly [@tynes](https://github.com/tynes).
