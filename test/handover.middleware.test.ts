@@ -174,6 +174,73 @@ describe('handover middleware: dual-mode HIP-5 TLDs', () => {
     expect(markerRecords(res).length).toBe(0);
   });
 
+  it('serves the re-entering recursor a marker-free referral and terminates (no loop)', async () => {
+    const node = makeNode();
+    const answer = new wire.Message();
+    answer.code = wire.codes.NOERROR;
+    answer.answer.push(wire.Record.fromJSON({ class: 'IN',
+      name: 'foo.hns.', ttl: 60, type: 'A', data: { address: '1.2.3.4' }
+    }));
+
+    const plugin = setupDualPlugin(node, { offchain: null });
+    let reentry: any = null;
+
+    // The real recursor sends the full qname back to the root stub, which
+    // re-enters the middleware while resolveOffchain is still pending.
+    (plugin as any).recursor = {
+      lookup: async (name: string, type: number) => {
+        reentry = await node.ns.middle!(
+          'hns.',
+          { question: [new wire.Question(name, type)] }
+        );
+
+        // ...then follows the real NS servers and produces an answer.
+        return answer;
+      }
+    };
+
+    const res = await node.ns.middle!('hns.', question(wire.types.A));
+
+    expect(reentry).not.toBeNull();
+    expect(reentry.authority.some((rr: any) => rr.type === wire.types.NS)).toBe(true);
+    expect(markerRecords(reentry).length).toBe(0);
+    expect(res.answer.map((rr: any) => rr.type)).toEqual([wire.types.A]);
+  });
+
+  it('recovers the eth fallback after a marker-free re-entry referral', async () => {
+    const node = makeNode();
+    const nxdomain = new wire.Message();
+    nxdomain.code = wire.codes.NXDOMAIN;
+
+    const aRecord = encodeRecord({
+      class: 'IN', name: 'foo.hns.', ttl: 60, type: 'A', data: { address: '1.2.3.4' }
+    });
+    const plugin = setupDualPlugin(node, {
+      offchain: nxdomain,
+      eth: (_name, type) => type === wire.types.A ? aRecord : null
+    });
+
+    // Re-enter once the way the real recursor would, before returning the
+    // off-chain negative.
+    (plugin as any).recursor = {
+      lookup: async (name: string, type: number) => {
+        await node.ns.middle!(
+          'hns.',
+          { question: [new wire.Question(name, type)] }
+        );
+        return nxdomain;
+      }
+    };
+
+    const res = await node.ns.middle!('hns.', question(wire.types.A));
+    expect(res.answer.length).toBe(1);
+    expect(res.answer[0].type).toBe(wire.types.A);
+    expect(markerRecords(res).length).toBe(0);
+
+    // The in-flight marker must be cleared once the lookup completes.
+    expect((plugin as any).inFlight.size).toBe(0);
+  });
+
   it('keeps the HIP-5 marker visible in NS delegations for on-chain names', async () => {
     const node = makeNode();
     const nxdomain = new wire.Message();
