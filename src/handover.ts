@@ -25,11 +25,77 @@ interface HsdNode {
   logger: any;
   config: any;
   chain: any;
+  // Internal recursive resolver surface (lib/dns/server.js
+  // RecursiveServer), used for off-chain resolution of dual-mode HIP-5
+  // TLDs. Optional because hsd only builds it when not run with no-rs.
+  rs?: HsdRecursorServer;
 }
 
 interface HsdQuestion {
   name: string;
   type: number;
+}
+
+// Zones an NS delegation target can point into to trigger a HIP-5
+// referral: plain 'eth' (main ENS registry) and '_eth' (alternate,
+// forked ENS whose contract is the Ethereum address in the NS record).
+// Plain object instead of an enum keeps the TS buildless
+// (erasableSyntaxOnly).
+type Hip5Zone = 'eth' | '_eth';
+
+const HIP5_ZONES = {
+  ETH: 'eth',
+  ABSTRACT: '_eth'
+} as const;
+
+// Root-zone qnames for the HIP-5 lookup TLDs ('eth.', '_eth.').
+const HIP5_ZONE_DOT = HIP5_ZONES.ETH + '.';
+const HIP5_ABSTRACT_DOT = HIP5_ZONES.ABSTRACT + '.';
+
+function isHip5Zone(value: string): value is Hip5Zone {
+  return value === HIP5_ZONES.ETH || value === HIP5_ZONES.ABSTRACT;
+}
+
+// Last DNS label of an NS delegation target (bns strips the trailing dot).
+// Returns the HIP-5 zone the target delegates into, null otherwise.
+export function hip5Target(ns: string): Hip5Zone | null {
+  const ending = util.label(ns, util.split(ns), -1);
+  return isHip5Zone(ending) ? ending : null;
+}
+
+// Split a referral's NS records into HIP-5 markers (delegations into
+// .eth / ._eth) and real, resolvable nameserver delegations. Dual-mode
+// TLDs (onchain + offchain names) ship both in the same root-zone
+// NS RRset.
+function classifyReferralNS(res: any): { markers: any[]; realNS: any[] } {
+  const markers: any[] = [];
+  const realNS: any[] = [];
+
+  for (const rr of res.authority) {
+    if (rr.type !== wire.types.NS) {
+      continue;
+    }
+
+    if (hip5Target(rr.data.ns)) {
+      markers.push(rr);
+    } else {
+      realNS.push(rr);
+    }
+  }
+
+  return { markers, realNS };
+}
+
+// Minimal surface of the bns UnboundResolver behind hsd's RecursiveServer
+// (node.rs.hns). Performs DNSSEC-validating off-chain recursion through the
+// real nameservers. Unavailable when hsd runs with no-rs.
+interface Recursor {
+  lookup: (name: string, type: number) => Promise<any>;
+}
+
+// Minimal surface of hsd's RecursiveServer (node.rs).
+interface HsdRecursorServer {
+  hns?: Recursor;
 }
 
 class Plugin {
@@ -38,6 +104,7 @@ class Plugin {
   ns: any;
   logger: any;
   ethereum: Ethereum;
+  recursor: Recursor | null;
   activationAbort: AbortController | null = null;
 
   constructor(node: HsdNode) {
@@ -48,6 +115,8 @@ class Plugin {
     this.ethereum = new Ethereum({
       rpcUrl: node.config.str('handover-rpc-url')
     });
+
+    this.recursor = node.rs?.hns ?? null;
 
     // The plugin cannot operate if the root server isn't enabled
     if (!this.ns) {
@@ -79,7 +148,7 @@ class Plugin {
       // referral for the TLD, we claim authority so it sends us the full name.
       let data;
       switch (tld) {
-        case 'eth.':
+        case HIP5_ZONE_DOT:
           if (labels.length < 2) {
             return this.sendSOA(name, tld, type);
           }
@@ -94,7 +163,7 @@ class Plugin {
           }
 
           return this.sendSOA(name, tld, type);
-        case '_eth.':
+        case HIP5_ABSTRACT_DOT:
           return this.sendSOA(name, tld, type);
       }
 
@@ -102,12 +171,13 @@ class Plugin {
       // We are going to examine the result before sending it back.
       const originalRes = await this.resolveHNS(req, name, type, tld);
 
-      // Special DS processing if the request is "<hip-5 tld> DS"
-      // handover won't find any referral in the answer
-      // it won't recognize it as a HIP5 name which results
-      // in a bad proof "NS RRSIG NSEC". Need to manually
-      // request "<hip-5 tld> NS" for handover to process it.
-      const res = type === wire.types.DS && labels.length === 1
+      // "<tld> DS" needs special processing: handover won't find any
+      // referral in the answer, it won't recognize it as a HIP-5 name
+      // which results in a bad proof "NS RRSIG NSEC". Manually request
+      // "<hip-5 tld> NS" below for handover to process it.
+      const tldDS = type === wire.types.DS && labels.length === 1;
+
+      const res = tldDS
         ? await this.resolveHNS({
             question: [
               new wire.Question(name, wire.types.NS)
@@ -119,80 +189,210 @@ class Plugin {
       // synthetic DS->NS rewrite, send the original DS response instead of
       // an NS-typed message to a DS question (HIP-5: no bare NS referrals).
       if (!res.authority.length) {
-        return type === wire.types.DS && labels.length === 1 ? originalRes : res;
+        return tldDS ? originalRes : res;
       }
 
-      let hip5Referral = false;
+      const { markers, realNS } = classifyReferralNS(res);
 
-      // Check NS records for HIP-5 referrals
-      for (const rr of res.authority) {
-        if (rr.type !== wire.types.NS) {
-          continue;
-        }
+      // Special DS processing if the request is "<hip-5 tld> DS":
+      // there is no on-chain DS, answer with the upstream NODATA NSEC
+      // proof whether or not the TLD carries a HIP-5 marker.
+      if (tldDS) {
+        return markers.length > 0
+          ? this.sendSOA(name, tld, type)
+          : originalRes;
+      }
 
-        const ending = util.label(rr.data.ns, util.split(rr.data.ns), -1);
+      // Bare TLD queries (e.g. "hns. NS"): this is where requesters look
+      // up the HIP-5 marker to detect cross-chain support, so keep the
+      // referral intact when the TLD is dual-mode. Pure HIP-5 TLDs (no
+      // resolvable NS) keep the upstream referral-hiding behavior.
+      if (labels.length < 2 && markers.length > 0) {
+        return realNS.length > 0 ? res : this.sendSOA(name, tld, type);
+      }
 
-        // Look for any supported HIP-5 extension in the NS record
-        // and query it for the user's original request.
-        if (ending === '_eth' || ending === 'eth') {
-          hip5Referral = true;
+      // Dual-mode TLD (real NS alongside the HIP-5 marker): resolve
+      // off-chain first. A plain DNS lookup is far cheaper than an
+      // Ethereum round trip, and it gives the off-chain zone final say:
+      // only an NXDOMAIN from it makes the name an on-chain candidate,
+      // and an off-chain answer always wins over eth.
+      let offchainNXDOMAIN: any = null;
 
-          // If the recursive is being minimal, don't look up the name.
-          // Send the SOA back and get the full query from the recursive.
-          if (labels.length < 2) {
-            return this.sendSOA(name, tld, type);
+      if (realNS.length > 0) {
+        const offchain = await this.resolveOffchain(name, type);
+
+        if (offchain) {
+          // Relay everything that isn't a definitive negative: answers
+          // (A, CNAME, NS, ...) and genuine upstream failures both carry
+          // more signal than our best guess would. Only NXDOMAIN proves
+          // the name wasn't published off-chain.
+          if (offchain.code !== wire.codes.NXDOMAIN) {
+            return offchain;
           }
-          this.logger.debug(
-            'Intercepted referral to .%s: %s %s -> %s NS: %s',
-            ending,
-            name,
-            wire.typesByVal[type],
-            rr.name,
-            rr.data.ns
-          );
 
-          try {
-            switch (ending) {
-              case 'eth':
-                data = await this.ethereum.resolveDnsFromEns(
-                  name,
-                  type,
-                  rr.data.ns
-                );
-                break;
-              case '_eth':
-                // Look up an alternate (forked) ENS contract by the Ethereum
-                // address specified in the NS record
-                data = await this.ethereum.resolveDnsFromAbstractEns(
-                  name,
-                  type,
-                  rr.data.ns
-                );
-                break;
-            }
-          } catch (e) {
-            this.logResolutionFailure(e, name);
-          }
+          offchainNXDOMAIN = offchain;
         }
       }
 
-      if (!data || data.length === 0) {
-        // Never send HIP-5 type referrals to recursive resolvers
-        // since they aren't real delegations and it could end up
-        // poisoning their cache.
-        if (hip5Referral) {
-          return this.sendSOA(name, tld, type);
-        }
+      // Resolve on-chain (cross-chain) names via the HIP-5 extension.
+      const hip5Data = await this.resolveDnsViaMarkers(name, type, markers);
 
+      // If we did get an answer, mark the response
+      // as authoritative and send the new answer. A and CNAME records
+      // (incl. CNAME chains) are routed into the answer section by
+      // sendData, per DNS spec.
+      if (hip5Data && hip5Data.length > 0) {
+        this.logger.debug('Returning answers from alternate naming system');
+        return this.sendData(hip5Data, type);
+      }
+
+      if (markers.length === 0) {
         // return the HNS root server response unmodified.
         return originalRes;
       }
 
-      // If we did get an answer, mark the response
-      // as authoritative and send the new answer.
-      this.logger.debug('Returning answers from alternate naming system');
-      return this.sendData(data, type);
+      if (realNS.length === 0) {
+        // Pure HIP-5 TLD with nothing on-chain: never send HIP-5 type
+        // referrals to recursive resolvers since they aren't real
+        // delegations and it could end up poisoning their cache.
+        return this.sendSOA(name, tld, type);
+      }
+
+      if (type === wire.types.NS) {
+        // Dual-mode TLD, NS question, no on-chain NS records: tell
+        // on-chain names from off-chain ones by probing A/CNAME (the
+        // types every live EIP-1185 name publishes). On-chain names keep
+        // the HIP-5 marker visible in their delegation; off-chain names
+        // never see it.
+        if (await this.isMintedOnChain(name, markers)) {
+          const delegation = new wire.Message();
+          delegation.aa = false;
+          delegation.authority = markers.slice();
+          this.ns.signRRSet(delegation.authority, wire.types.DS);
+          return delegation;
+        }
+      }
+
+      if (offchainNXDOMAIN) {
+        // Name doesn't exist off-chain and has nothing on-chain either:
+        // relay the off-chain zone's NXDOMAIN (honest, validated
+        // negative proof).
+        return offchainNXDOMAIN;
+      }
+
+      // Off-chain name under a dual-mode TLD (recursive resolver not
+      // available): strip the HIP-5 marker from the referral so the
+      // recursive resolves it off-chain through the real nameservers,
+      // and a requester cannot mistake this for an on-chain delegation.
+      return this.stripHip5(res);
     };
+  }
+
+  // Full off-chain (real NS) resolution via the node's internal recursive
+  // resolver. Returns null when recursion is unavailable or failed; the
+  // caller then falls back to the on-chain-first upstream behavior.
+  async resolveOffchain(name: string, type: number) {
+    if (!this.recursor) {
+      return null;
+    }
+
+    try {
+      return await this.recursor.lookup(name, type);
+    } catch (e) {
+      this.logResolutionFailure(e, name);
+      return null;
+    }
+  }
+
+  // Resolve the requested type through the given HIP-5 markers, returning
+  // the first DNS record set the Ethereum side yields (A and CNAME chains
+  // included). Ethereum resolution historically returns null for misses;
+  // every miss or failure falls through to the next marker.
+  async resolveDnsViaMarkers(
+    name: string,
+    type: number,
+    markers: any[]
+  ): Promise<Buffer | undefined | null> {
+    for (const rr of markers) {
+      const ending = hip5Target(rr.data.ns);
+      if (ending === null) {
+        continue;
+      }
+
+      this.logger.debug(
+        'Intercepted referral to .%s: %s %s -> %s NS: %s',
+        ending,
+        name,
+        wire.typesByVal[type],
+        rr.name,
+        rr.data.ns
+      );
+
+      try {
+        if (ending === HIP5_ZONES.ETH) {
+          const data = await this.ethereum.resolveDnsFromEns(
+            name,
+            type,
+            rr.data.ns
+          );
+
+          if (data && data.length > 0) {
+            return data;
+          }
+        } else {
+          // Look up an alternate (forked) ENS contract by the Ethereum
+          // address specified in the NS record
+          const data = await this.ethereum.resolveDnsFromAbstractEns(
+            name,
+            type,
+            rr.data.ns
+          );
+
+          if (data && data.length > 0) {
+            return data;
+          }
+        }
+      } catch (e) {
+        this.logResolutionFailure(e, name);
+      }
+    }
+
+    return undefined;
+  }
+
+  // Detect whether a name is minted on-chain when the DNS lookup for the
+  // requested type (NS) yields nothing. EIP-1185 datasets don't reliably
+  // publish NS records, so probe A and CNAME instead. Not airtight (a
+  // name with only MX/TXT records reads as off-chain) but covers how
+  // these domains are used in practice.
+  async isMintedOnChain(name: string, markers: any[]): Promise<boolean> {
+    for (const probeType of [wire.types.A, wire.types.CNAME]) {
+      const data = await this.resolveDnsViaMarkers(
+        name,
+        probeType,
+        markers
+      );
+
+      if (data && data.length > 0) {
+        return true;
+      }
+    }
+
+    return false;
+  }
+
+  // Copy of res with the HIP-5 marker NS records removed. The input comes
+  // from hsd's resolver cache and must not be mutated.
+  stripHip5(res: any) {
+    const out = new wire.Message();
+    out.code = res.code;
+    out.aa = res.aa;
+    out.answer = res.answer.slice();
+    out.authority = res.authority.filter((rr: any) => {
+      return rr.type !== wire.types.NS || hip5Target(rr.data.ns) === null;
+    });
+    out.additional = res.additional;
+    return out;
   }
 
   async open() {
