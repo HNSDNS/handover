@@ -12,7 +12,7 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/imperviousinc/handover.git"
+    "url": "git+https://github.com/HNSDNS/handover.git"
   },
   "keywords": [
     "Handshake",
@@ -28,7 +28,7 @@
   "bugs": {
     "url": "https://github.com/imperviousinc/handover/issues"
   },
-  "homepage": "https://github.com/imperviousinc/handover#readme",
+  "homepage": "https://github.com/HNSDNS/handover#readme",
   "engines": {
     "node": ">=24"
   },
