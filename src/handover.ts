@@ -106,6 +106,13 @@ class Plugin {
   ethereum: Ethereum;
   recursor: Recursor | null;
   activationAbort: AbortController | null = null;
+  // Qnames currently being resolved off-chain via the internal recursor.
+  // hsd's recursive resolver sends the full qname to the root (bns does no
+  // wire-level qname minimization), so every off-chain lookup re-enters
+  // this middleware with the identical question it is still processing.
+  // Without tracking that, resolveOffchain -> recursor -> root -> middleware
+  // recurses without bound and every lookup starves behind it.
+  inFlight = new Set<string>();
 
   constructor(node: HsdNode) {
     this.node = node;
@@ -140,6 +147,19 @@ class Plugin {
       const name = qs.name.toLowerCase();
       const type = qs.type;
       const labels = util.split(name);
+
+      // Re-entrant query from the internal recursor (see inFlight): hand it
+      // the plain, marker-free referral so it terminates by following the
+      // real nameservers off-chain. stripHip5 also strips nothing from a
+      // record-free (e.g. cached NXDOMAIN) response.
+      if (this.inFlight.has(name)) {
+        this.logger.debug(
+          'Off-chain re-entry for %s; relaying referral without HIP-5 marker',
+          name
+        );
+        const referral = await this.resolveHNS(req, name, type, tld);
+        return this.stripHip5(referral);
+      }
 
       // The plugin can resolve direct queries for ENS (.eth) names,
       // but we must get the complete query string from the recursive resolver.
@@ -296,11 +316,19 @@ class Plugin {
       return null;
     }
 
+    // Mark the qname in flight before recursing: the recursor reaches the
+    // root again, which re-enters this middleware for the same name (see
+    // the inFlight check at the top of the middleware). This is the only
+    // path from which the middleware can re-enter itself.
+    this.inFlight.add(name);
+
     try {
       return await this.recursor.lookup(name, type);
     } catch (e) {
       this.logResolutionFailure(e, name);
       return null;
+    } finally {
+      this.inFlight.delete(name);
     }
   }
 
