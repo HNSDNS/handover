@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import bns from 'bns';
 import { init } from '../src/handover.ts';
 
@@ -15,7 +15,7 @@ function makeNode(): FakeNode {
   return {
     ns: {},
     config: { str: () => 'http://127.0.0.1:8545' },
-    logger: { context: () => ({ debug() {}, warning() {} }) },
+    logger: { context: () => ({ debug() {}, warning() {}, info() {} }) },
     chain: {}
   };
 }
@@ -44,5 +44,61 @@ describe('handover middleware: DS->NS rewrite (HIP-5)', () => {
     // NS-typed message the synthetic rewrite produced. Without the fix the
     // empty-authority NS response would be returned (answer.length === 0).
     expect(res.answer.length).toBe(1);
+  });
+});
+
+describe('handover plugin activation retry', () => {
+  it('does not throw on a failing Ethereum client and retries in the background', async () => {
+    vi.useFakeTimers();
+
+    const node = makeNode();
+    const plugin = init(node as any);
+
+    // Simulate helios rejecting state proofs ("distance to target block
+    // exceeds maximum proof window"): init() fails, but activation must not
+    // propagate the error to hsd's openPlugins (that crash-loops the node).
+    let fail = true;
+    (plugin as any).ethereum.init = async () => {
+      if (fail) {
+        throw new Error('distance to target block exceeds maximum proof window');
+      }
+    };
+
+    await expect(plugin.activate()).resolves.toBeUndefined();
+    expect(plugin.ready).toBe(false);
+
+    // The retry runner (60s interval) recovers once the client works again.
+    fail = false;
+    await vi.advanceTimersByTimeAsync(60 * 1000);
+    expect(plugin.ready).toBe(true);
+    expect(plugin.activationAbort).toBe(null);
+
+    plugin.close();
+    vi.useRealTimers();
+  });
+
+  it('deduplicates concurrent activate() calls', async () => {
+    vi.useFakeTimers();
+
+    const node = makeNode();
+    const plugin = init(node as any);
+    let calls = 0;
+    (plugin as any).ethereum.init = async () => {
+      calls++;
+      throw new Error('out of sync');
+    };
+
+    const p1 = plugin.activate();
+    const p2 = plugin.activate();
+
+    await expect(p1).resolves.toBeUndefined();
+    await expect(p2).resolves.toBeUndefined();
+    // Second call returned immediately because a retry runner was running.
+    await vi.advanceTimersByTimeAsync(60 * 1000);
+    expect(calls).toBe(2);
+    expect(plugin.ready).toBe(false);
+
+    plugin.close();
+    vi.useRealTimers();
   });
 });
