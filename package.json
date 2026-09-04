@@ -33,6 +33,7 @@
     "node": ">=24"
   },
   "dependencies": {
+    "p-retry": "^8.0.1",
     "viem": "^2.56.3"
   },
   "peerDependencies": {

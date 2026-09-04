@@ -1,10 +1,16 @@
 import bns from 'bns';
 import { BufferReader } from 'bufio';
+import pRetry from 'p-retry';
 import Ethereum from './ethereum.ts';
 
 const { wire, util } = bns;
 
 const TYPE_MAP_EMPTY = Buffer.from('0006000000000003', 'hex');
+
+// Helios may reject state-proofs for minutes after it starts ("distance to
+// target block exceeds maximum proof window"), so keep retrying activation
+// in the background instead of letting the node crash-loop.
+const ACTIVATION_RETRY_DELAY = 60 * 1000;
 const TYPE_MAP_ALL = [
   wire.types.A, wire.types.HINFO, wire.types.MX,
   wire.types.TXT, wire.types.AAAA, wire.types.LOC, wire.types.SRV,
@@ -32,6 +38,7 @@ class Plugin {
   ns: any;
   logger: any;
   ethereum: Ethereum;
+  activationAbort: AbortController | null = null;
 
   constructor(node: HsdNode) {
     this.node = node;
@@ -205,13 +212,57 @@ class Plugin {
   }
 
   // Initialize the Ethereum client and start answering queries. Safe to call
-  // multiple times (init re-fetches the resolver).
+  // multiple times (a repeat call once the previous retry runner has finished
+  // re-fetches the resolver). Never throws an RPC error back at hsd: a throw
+  // from here would fail FullNode.openPlugins and crash-loop the node
+  // (helios rejects state proofs until it is caught up with the chain tip).
+  // Instead, stay not-ready and retry in the background at a fixed interval
+  // until the Ethereum client responds — one retry runner at a time.
   async activate() {
-    await this.ethereum.init();
-    this.ready = true;
-    this.logger.info(
-      'handover external network resolver plugin is active!'
-    );
+    if (this.activationAbort) {
+      return;
+    }
+
+    const controller = new AbortController();
+    this.activationAbort = controller;
+
+    void pRetry(
+      async () => {
+        await this.ethereum.init();
+        this.activationAbort = null;
+        this.ready = true;
+        this.logger.info(
+          'handover external network resolver plugin is active!'
+        );
+      },
+      {
+        retries: Infinity,
+        minTimeout: ACTIVATION_RETRY_DELAY,
+        maxTimeout: ACTIVATION_RETRY_DELAY,
+        factor: 1,
+        unref: true,
+        signal: controller.signal,
+        onFailedAttempt: ({ error, attemptNumber }) => {
+          this.ready = false;
+          this.logger.warning(
+            'handover activation attempt %d failed, retrying in %d seconds: %s',
+            attemptNumber,
+            ACTIVATION_RETRY_DELAY / 1000,
+            error.message
+          );
+          this.logger.debug(error.stack);
+        }
+      }
+    ).catch(() => {
+      // Unreachable while retries is Infinity; only close() (via the abort
+      // signal) or process shutdown can get us here. Nothing to do.
+    });
+  }
+
+  // Cancel any background retry runner, e.g. when the plugin is closed.
+  stopRetry() {
+    this.activationAbort?.abort(new Error('handover plugin closed'));
+    this.activationAbort = null;
   }
 
   // Both middleware lookup paths log failures the same way.
@@ -222,6 +273,7 @@ class Plugin {
 
   close() {
     this.ready = false;
+    this.stopRetry();
   }
 
   // Mirrors hsd's server.resolve(): look up a name on HNS normally.
