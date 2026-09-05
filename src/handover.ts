@@ -1,7 +1,7 @@
 import bns from 'bns';
 import { BufferReader } from 'bufio';
 import pRetry from 'p-retry';
-import Ethereum from './ethereum.ts';
+import Ethereum, { EthereumUnhealthyError } from './ethereum.ts';
 import { HIP5_ZONES, HIP5_ZONE_DOT, HIP5_ABSTRACT_DOT, hip5Target, isHip5NS, pruneHip5Authority } from './hip5.ts';
 import OffchainResolver from './offchain.ts';
 
@@ -132,6 +132,14 @@ class Plugin {
               return this.sendData(data, type);
             }
           } catch (e) {
+            // A dead RPC must not answer as a cacheable negative: recursive
+            // resolvers would park the name until the SOA TTL. SERVFAIL keeps
+            // them probing. Contract misses keep the audited SOA fallback
+            // (a miss is real on-chain state, not unavailability).
+            if (e instanceof EthereumUnhealthyError) {
+              return this.sendServfail();
+            }
+
             this.logResolutionFailure(e, name);
           }
 
@@ -223,8 +231,20 @@ class Plugin {
         }
       }
 
-      // Resolve on-chain (cross-chain) names via the HIP-5 extension.
-      const hip5Data = await this.resolveDnsViaMarkers(name, type, markers);
+      // Resolve on-chain (cross-chain) names via the HIP-5 extension. An
+      // unhealthy Ethereum RPC aborts the whole marker loop and surfaces
+      // here: answer SERVFAIL rather than a cacheable negative that would
+      // hide on-chain names from recursive resolvers.
+      let hip5Data;
+      try {
+        hip5Data = await this.resolveDnsViaMarkers(name, type, markers);
+      } catch (e) {
+        if (e instanceof EthereumUnhealthyError) {
+          return this.sendServfail();
+        }
+
+        throw e;
+      }
 
       // If we did get an answer, mark the response
       // as authoritative and send the new answer. A and CNAME records
@@ -248,7 +268,20 @@ class Plugin {
         // types every live EIP-1185 name publishes). On-chain names keep
         // the HIP-5 marker visible in their delegation; off-chain names
         // never see it.
-        if (await this.isMintedOnChain(name, markers)) {
+        // The A/CNAME probe runs through resolveDnsViaMarkers, so the
+        // unhealthy error surfaces here too.
+        let mintedOnChain = false;
+        try {
+          mintedOnChain = await this.isMintedOnChain(name, markers);
+        } catch (e) {
+          if (e instanceof EthereumUnhealthyError) {
+            return this.sendServfail();
+          }
+
+          throw e;
+        }
+
+        if (mintedOnChain) {
           const delegation = new wire.Message();
           delegation.aa = false;
           delegation.authority = markers.slice();
@@ -343,6 +376,12 @@ class Plugin {
           }
         }
       } catch (e) {
+        // Unavailability aborts the loop: trying the next marker would just
+        // hit the same dead RPC (and the gate would short-circuit anyway).
+        if (e instanceof EthereumUnhealthyError) {
+          throw e;
+        }
+
         this.logResolutionFailure(e, name);
       }
     }
@@ -498,6 +537,15 @@ class Plugin {
       }
     }
 
+    return res;
+  }
+
+  // SERVFAIL when the Ethereum side is known to be down: unlike a
+  // SOA/NSEC negative this is not cacheable, so recursive resolvers will
+  // retry quickly once the RPC recovers.
+  sendServfail() {
+    const res = new wire.Message();
+    res.code = wire.codes.SERVFAIL;
     return res;
   }
 
