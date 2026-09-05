@@ -16,17 +16,20 @@ import { mainnet } from 'viem/chains';
 import { normalize } from 'viem/ens';
 import LRU from 'blru';
 import bns from 'bns';
+import { HIP5_ZONES, hip5Target } from './hip5.ts';
 
 const { wire, util, encoding } = bns;
 
 export const ENS_ADDRESS: Address = '0x00000000000C2E074eC69A0dFb2997BA6C7d2e1e';
-const ZERO_ADDRESS: Address = '0x0000000000000000000000000000000000000000';
-const DEFAULT_RPC_URL = 'http://127.0.0.1:8545';
+export const ZERO_ADDRESS: Address = '0x0000000000000000000000000000000000000000';
+export const DEFAULT_RPC_URL = 'http://127.0.0.1:8545';
 const CACHE_TTL = 30 * 60 * 1000;
 
 // ENS root TLD sentinel: its node's official resolver must never be used to
-// answer for arbitrary *.eth names (it has no wildcard resolver).
-const ETH_TLD = 'eth';
+// answer for arbitrary *.eth names (it has no wildcard resolver). Derived
+// from the shared HIP-5 definition so the sentinel can't drift from the zone
+// the resolver plugin routes on.
+const ETH_TLD = HIP5_ZONES.ETH;
 
 const CACHE_TAGS = {
   DNS: 0,
@@ -314,11 +317,12 @@ export default class Ethereum {
   }
 
   async getResolverFromRegistry(name: string, registry: any): Promise<any> {
-    const resolverAddr: string = await registry.read.resolver([
+    const resolverAddr = await this.#readResolverAddress(
+      registry,
       this.namehash(util.trimFQDN(name))
-    ]);
+    );
 
-    if (resolverAddr.toLowerCase() === ZERO_ADDRESS) {
+    if (resolverAddr === null) {
       return null;
     }
 
@@ -350,19 +354,20 @@ export default class Ethereum {
     });
   }
 
+  // ENS registry resolver lookup for a node: the resolver address, or null
+  // when the node is unregistered (the registry returns the zero address).
+  // Shared by the cached getResolver path and the resolveEns* convenience
+  // APIs so registry/zero-address handling stays in one place.
+  async #readResolverAddress(registry: any, node: Hash): Promise<string | null> {
+    const address = (await registry.read.resolver([node])) as string;
+    return address.toLowerCase() === ZERO_ADDRESS ? null : address;
+  }
+
   // Registry lookup shared by the resolveEns* convenience APIs: the resolver
   // address for a node, or null when the node is unregistered (the registry
   // returns the zero address).
   async #nodeResolverAddress(node: Hash): Promise<string | null> {
-    const resolverAddress = (await this.ensRegistry.read.resolver([
-      node
-    ])) as string;
-
-    if (resolverAddress.toLowerCase() === ZERO_ADDRESS) {
-      return null;
-    }
-
-    return resolverAddress;
+    return this.#readResolverAddress(this.ensRegistry, node);
   }
 
   // Mirrors ethers@5.0.x BaseProvider behavior (the version the original
@@ -568,12 +573,14 @@ export default class Ethereum {
       node = this.toNode(name);
     }
 
-    const labels = ns.split('.');
-
-    if (labels.length !== 3 || labels[1] !== '_eth') {
+    // Classify the zone through the shared HIP-5 parser so a mixed-case
+    // marker like "<addr>._Eth." resolves the same as the lowercase form
+    // (hip5Target lowercases the final label).
+    if (hip5Target(ns) !== HIP5_ZONES.ABSTRACT) {
       return null;
     }
 
+    const labels = util.trimFQDN(ns).split('.');
     const addr = labels[0];
 
     if (addr.length !== 42) {
