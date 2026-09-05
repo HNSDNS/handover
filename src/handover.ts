@@ -184,11 +184,22 @@ class Plugin {
         return realNS.length > 0 ? res : this.sendSOA(name, tld, type);
       }
 
-      // Dual-mode TLD (real NS alongside the HIP-5 marker): resolve
-      // off-chain first. A plain DNS lookup is far cheaper than an
-      // Ethereum round trip, and it gives the off-chain zone final say:
-      // only an NXDOMAIN from it makes the name an on-chain candidate,
-      // and an off-chain answer always wins over eth.
+      // A referral with no HIP-5 markers is a plain delegation — an ICANN
+      // mirror TLD (com., it.) or an ordinary HNS TLD. The parent recursive
+      // resolver must follow the real NS referral itself: running the
+      // off-chain resolver here duplicates a full recursion in-process
+      // (double resolve) whose result would be discarded below, so the
+      // middleware keeps its classifier-only role for marker-free zones
+      // and passes the upstream response through untouched.
+      if (markers.length === 0) {
+        return originalRes;
+      }
+
+      // True dual-mode TLD (real NS alongside the HIP-5 marker; marker-free
+      // zones already returned above): resolve off-chain first. A plain DNS
+      // lookup is far cheaper than an Ethereum round trip, and it gives the
+      // off-chain zone final say: only an NXDOMAIN from it makes the name an
+      // on-chain candidate, and an off-chain answer always wins over eth.
       let offchainNXDOMAIN: any = null;
 
       if (realNS.length > 0) {
@@ -222,11 +233,6 @@ class Plugin {
       if (hip5Data && hip5Data.length > 0) {
         this.logger.debug('Returning answers from alternate naming system');
         return this.sendData(hip5Data, type);
-      }
-
-      if (markers.length === 0) {
-        // return the HNS root server response unmodified.
-        return originalRes;
       }
 
       if (realNS.length === 0) {
