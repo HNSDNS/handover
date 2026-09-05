@@ -1,6 +1,7 @@
 import bns from 'bns';
+import { pruneHip5Authority } from './hip5.ts';
 
-const { wire, util, dnssec } = bns;
+const { wire, dnssec } = bns;
 
 const { types, codes } = wire;
 
@@ -8,23 +9,6 @@ const { types, codes } = wire;
 // internally (maxAttempts × maxTimeout); this guard keeps a wedged stub or
 // an unreachable nameserver from hanging the middleware past that.
 const RESOLUTION_TIMEOUT = 10 * 1000;
-
-// Zones an NS delegation target can point into to mark a HIP-5 referral.
-// Mirrors hip5Target() in handover.ts; kept local so this module stays off
-// the handover import graph.
-const HIP5_ZONES = new Set(['eth', '_eth']);
-
-function isHip5NS(rr: any): boolean {
-  if (rr.type !== types.NS) {
-    return false;
-  }
-
-  // Last label, trailing dot or not.
-  const name = String(rr.data.ns).toLowerCase();
-  const label = util.label(name, util.split(name), -1);
-
-  return HIP5_ZONES.has(label);
-}
 
 export interface OffchainHooks {
   // Root-zone lookup that bypasses ns.middle (the plugin's resolveHNS).
@@ -65,11 +49,14 @@ export default class OffchainResolver {
   #stub: any;
   #resolver: any;
   #opened = false;
+  #stubOpened = false;
   #opening: Promise<void> | null = null;
+  #timeout: number;
 
-  constructor(hooks: OffchainHooks, logger?: any) {
+  constructor(hooks: OffchainHooks, logger?: any, timeout: number = RESOLUTION_TIMEOUT) {
     this.#hooks = hooks;
     this.#logger = logger ?? null;
+    this.#timeout = timeout;
 
     this.#stub = new bns.DNSServer({ inet6: false, tcp: true });
     this.#stub.ra = false;
@@ -102,14 +89,15 @@ export default class OffchainResolver {
   // resolves to a Message so the server layer never leaves the recursor
   // hanging.
   async resolve(req: any, _rinfo: any): Promise<any> {
-    const [qs] = req.question;
-
     try {
+      // Destructure inside the try: a malformed request (no/empty question)
+      // throws here and is normalized to SERVFAIL below instead of leaving
+      // the recursor hanging.
+      const [qs] = req.question;
       return await this.#mirror(await this.#hooks.resolve(qs.name, qs.type));
     } catch (e) {
       this.#log(
-        'mirror failure for %s: %s',
-        qs.name,
+        'mirror failure: %s',
         (e as Error).stack || (e as Error).message
       );
 
@@ -119,36 +107,119 @@ export default class OffchainResolver {
     }
   }
 
+  // Bring the stub + recursor pair up, bounded so a wedged bring-up cannot
+  // leave the shared, memoized `open()` pending forever. Lookups inside the
+  // middleware all await the same `open()` promise; if it never settled, a
+  // single stalled request would hang every off-chain query behind it (and
+  // DoH endpoints that expect a prompt answer would time out / EOF). On
+  // timeout the memo resets so the next lookup retries from scratch, and
+  // callers fail fast into the on-chain path instead of stalling.
+  #bringUp(): Promise<void> {
+    // If the deadline fires while the bring-up is mid-flight (after the stub
+    // bound its loopback socket but before `#resolver.open()` completes),
+    // the socket must not be left behind: `#stubOpened` is tracked so a
+    // retried bring-up or `close()` always releases it.
+    let aborted = false;
+
+    const bring = (async () => {
+      if (aborted) {
+        throw new Error('off-chain resolver bring-up aborted');
+      }
+
+      // Pin the trust anchor from the root's own DNSKEY answer: the KSK
+      // whose signatures cover the '. DNSKEY' RRset we relay.
+      const parent = await this.#hooks.resolve('.', types.DNSKEY);
+      const ksk = parent.answer.find((rr: any) => {
+        return rr.type === types.DNSKEY && (rr.data.flags & wire.keyFlags.KSK);
+      });
+
+      if (aborted) {
+        throw new Error('off-chain resolver bring-up aborted');
+      }
+
+      if (ksk == null) {
+        throw new Error('Root zone has no KSK to anchor off-chain recursion.');
+      }
+
+      // Same bytes through this module's own Record class: dnssec.createDS
+      // asserts `instanceof`, and relayed records may come from hsd's bns
+      // copy, which is a distinct module instance.
+      const anchorKey = wire.Record.fromJSON(ksk.toJSON());
+      const anchor = dnssec.createDS(anchorKey, dnssec.hashes.SHA256);
+
+      this.#log('off-chain resolver pinned root trust anchor');
+
+      await this.#stub.open(0, '127.0.0.1');
+      this.#stubOpened = true;
+
+      const { port } = this.#stub.address();
+      this.#log('off-chain resolver mirror listening on 127.0.0.1:%d', port);
+      this.#resolver.setStub('127.0.0.1', port, anchor);
+      await this.#resolver.open();
+
+      if (aborted) {
+        throw new Error('off-chain resolver bring-up aborted');
+      }
+
+      this.#opened = true;
+      this.#log('off-chain resolver ready (stub %s)', this.stubAddress);
+    })();
+
+    const { done } = this.#setTimeout();
+    const deadline = done.then(() => {
+      aborted = true;
+      throw new Error('off-chain resolver failed to open within timeout');
+    });
+
+    return Promise.race([bring, deadline]).finally(() => {
+      // Only a half-open bring-up (bound the stub but never fully opened:
+      // deadline fired, or a step after stub.open threw) must release it
+      // here. A fully-opened resolver stays up for the lookups it serves.
+      if (this.#stubOpened && !this.#opened) {
+        void this.#teardownOpened();
+      }
+    });
+  }
+
+  // Tear down whatever bring-up left open, zeroing the open flags first so
+  // a concurrent close() (or vice versa) can't double-close. Both the
+  // deadline finalizer and close() route through here; the single place
+  // also fixes the close ordering (resolver before stub).
+  async #teardownOpened(): Promise<void> {
+    const resolverOpen = this.#opened;
+    const stubOpen = this.#stubOpened;
+    this.#opened = false;
+    this.#stubOpened = false;
+
+    if (resolverOpen) {
+      await this.#resolver.close().catch(() => {});
+    }
+    if (stubOpen) {
+      await this.#stub.close().catch(() => {});
+    }
+  }
+
+  // Unref'd one-shot timer resolving after the resolution timeout. The
+  // bring-up deadline, close(), and lookup() each apply their own settle
+  // semantics on top; a cancelled loser never settles late (and never
+  // rejects unhandled).
+  #setTimeout(): { done: Promise<void>; cancel: () => void } {
+    let cancel = () => {};
+    const done = new Promise<void>((resolve) => {
+      const timer = setTimeout(resolve, this.#timeout);
+      timer.unref();
+      cancel = () => clearTimeout(timer);
+    });
+    return { done, cancel };
+  }
+
   async open(): Promise<void> {
     if (this.#opened) {
       return;
     }
 
     if (!this.#opening) {
-      const opening = (async () => {
-        // Pin the trust anchor from the root's own DNSKEY answer: the KSK
-        // whose signatures cover the '. DNSKEY' RRset we relay.
-        const parent = await this.#hooks.resolve('.', types.DNSKEY);
-        const ksk = parent.answer.find((rr: any) => {
-          return rr.type === types.DNSKEY && (rr.data.flags & wire.keyFlags.KSK);
-        });
-
-        if (ksk == null) {
-          throw new Error('Root zone has no KSK to anchor off-chain recursion.');
-        }
-
-        // Same bytes through this module's own Record class: dnssec.createDS
-        // asserts `instanceof`, and relayed records may come from hsd's bns
-        // copy, which is a distinct module instance.
-        const anchorKey = wire.Record.fromJSON(ksk.toJSON());
-        const anchor = dnssec.createDS(anchorKey, dnssec.hashes.SHA256);
-
-        await this.#stub.open(0, '127.0.0.1');
-        const { port } = this.#stub.address();
-        this.#resolver.setStub('127.0.0.1', port, anchor);
-        await this.#resolver.open();
-        this.#opened = true;
-      })();
+      const opening = this.#bringUp();
 
       // A failed bring-up (no KSK yet, bind refused) must not stay
       // memoized: the next lookup would replay a rejected promise
@@ -165,48 +236,67 @@ export default class OffchainResolver {
   }
 
   async close(): Promise<void> {
-    try {
-      await this.#opening;
-      this.#opening = null;
+    const opening = this.#opening;
+    this.#opening = null;
 
-      if (this.#opened) {
-        this.#opened = false;
-        await this.#resolver.close();
-        await this.#stub.close();
-      }
-    } catch (e) {
-      this.#opening = null;
-      this.#opened = false;
+    // Don't let a never-settling bring-up block shutdown: wait at most the
+    // resolution timeout for it, then tear down whatever is actually open.
+    if (opening) {
+      const { done } = this.#setTimeout();
+      await Promise.race([opening.catch(() => {}), done]);
     }
+
+    await this.#teardownOpened();
   }
 
   async lookup(name: string, type: number): Promise<any> {
     await this.open();
 
-    return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => {
-        reject(new Error(`off-chain lookup timed out: ${name} ${type}`));
-      }, RESOLUTION_TIMEOUT);
+    this.#log('off-chain lookup: %s %s', name, type);
 
-      timer.unref();
-
-      this.#resolver.lookup(name, type).then(
-        (msg: any) => {
-          clearTimeout(timer);
-          resolve(msg);
-        },
-        (err: any) => {
-          clearTimeout(timer);
-          reject(err);
-        }
-      );
-    });
+    // The timeout below cannot abort the underlying query — bns 0.16 has
+    // no per-query cancellation primitive, and tearing down the shared
+    // resolver would kill concurrent lookups. The abandoned query still
+    // self-bounds through the recursor's maxAttempts × maxTimeout, so
+    // this only caps how long a *caller* waits.
+    const { done, cancel } = this.#setTimeout();
+    try {
+      return await Promise.race([
+        this.#resolver.lookup(name, type).then(
+          (msg: any) => {
+            this.#log(
+              'off-chain answer: %s %s -> code=%s (%d answers)',
+              name,
+              type,
+              msg.code,
+              msg.answer ? msg.answer.length : 0
+            );
+            return msg;
+          },
+          (err: any) => {
+            this.#log(
+              'off-chain lookup failed: %s %s (%s)',
+              name,
+              type,
+              (err as Error).message
+            );
+            throw err;
+          }
+        ),
+        done.then(() => {
+          this.#log('off-chain lookup timed out: %s %s', name, type);
+          throw new Error(`off-chain lookup timed out: ${name} ${type}`);
+        })
+      ]);
+    } finally {
+      cancel();
+    }
   }
 
   // Relay an HNS root response; prune HIP-5 marker NS records and re-sign
   // the pruned delegation. Everything else keeps the root's signatures.
-  // The signer appends its RRSIG to the array it is given; only the fresh
-  // signature records flow back into the relayed message.
+  // Signer contract is documented beside pruneHip5Authority (hip5.ts):
+  // only the fresh signature records flow back into the relayed message.
   #mirror(msg: any): any {
     const res = new wire.Message();
 
@@ -215,57 +305,10 @@ export default class OffchainResolver {
     res.ad = msg.ad;
     res.answer = msg.answer;
     res.additional = msg.additional;
-
-    const markers = msg.authority.filter((rr: any) => isHip5NS(rr));
-
-    if (markers.length === 0) {
-      res.authority = msg.authority;
-      return res;
-    }
-
-    const nsOwner = markers[0].name;
-
-    // Marker-free NS records of the delegation, re-signed as a group.
-    const nsSet: any[] = [];
-
-    for (const rr of msg.authority) {
-      if (rr.type === types.NS
-          && !isHip5NS(rr)
-          && util.equal(rr.name, nsOwner)) {
-        nsSet.push(rr);
-      }
-    }
-
-    if (nsSet.length > 0) {
-      this.#hooks.sign(nsSet, types.NS);
-    }
-
-    const out: any[] = [];
-
-    for (const rr of msg.authority) {
-      // Markers themselves are never relayed.
-      if (isHip5NS(rr)) {
-        continue;
-      }
-
-      // The old NS signature no longer covers the pruned subset.
-      if (rr.type === types.RRSIG
-          && rr.data.typeCovered === types.NS
-          && util.equal(rr.name, nsOwner)) {
-        continue;
-      }
-
-      out.push(rr);
-    }
-
-    // The signer's fresh RRSIGs arrived on the nsSet array.
-    for (const rr of nsSet) {
-      if (rr.type === types.RRSIG) {
-        out.push(rr);
-      }
-    }
-
-    res.authority = out;
+    res.authority = pruneHip5Authority(
+      msg.authority,
+      (nsSet, type) => this.#hooks.sign(nsSet, type)
+    );
 
     return res;
   }

@@ -2,6 +2,7 @@ import bns from 'bns';
 import { BufferReader } from 'bufio';
 import pRetry from 'p-retry';
 import Ethereum from './ethereum.ts';
+import { HIP5_ZONES, HIP5_ZONE_DOT, HIP5_ABSTRACT_DOT, hip5Target, isHip5NS, pruneHip5Authority } from './hip5.ts';
 import OffchainResolver from './offchain.ts';
 
 const { wire, util } = bns;
@@ -33,33 +34,6 @@ interface HsdQuestion {
   type: number;
 }
 
-// Zones an NS delegation target can point into to trigger a HIP-5
-// referral: plain 'eth' (main ENS registry) and '_eth' (alternate,
-// forked ENS whose contract is the Ethereum address in the NS record).
-// Plain object instead of an enum keeps the TS buildless
-// (erasableSyntaxOnly).
-type Hip5Zone = 'eth' | '_eth';
-
-const HIP5_ZONES = {
-  ETH: 'eth',
-  ABSTRACT: '_eth'
-} as const;
-
-// Root-zone qnames for the HIP-5 lookup TLDs ('eth.', '_eth.').
-const HIP5_ZONE_DOT = HIP5_ZONES.ETH + '.';
-const HIP5_ABSTRACT_DOT = HIP5_ZONES.ABSTRACT + '.';
-
-function isHip5Zone(value: string): value is Hip5Zone {
-  return value === HIP5_ZONES.ETH || value === HIP5_ZONES.ABSTRACT;
-}
-
-// Last DNS label of an NS delegation target (bns strips the trailing dot).
-// Returns the HIP-5 zone the target delegates into, null otherwise.
-export function hip5Target(ns: string): Hip5Zone | null {
-  const ending = util.label(ns, util.split(ns), -1);
-  return isHip5Zone(ending) ? ending : null;
-}
-
 // Split a referral's NS records into HIP-5 markers (delegations into
 // .eth / ._eth) and real, resolvable nameserver delegations. Dual-mode
 // TLDs (onchain + offchain names) ship both in the same root-zone
@@ -69,13 +43,9 @@ function classifyReferralNS(res: any): { markers: any[]; realNS: any[] } {
   const realNS: any[] = [];
 
   for (const rr of res.authority) {
-    if (rr.type !== wire.types.NS) {
-      continue;
-    }
-
-    if (hip5Target(rr.data.ns)) {
+    if (isHip5NS(rr)) {
       markers.push(rr);
-    } else {
+    } else if (rr.type === wire.types.NS) {
       realNS.push(rr);
     }
   }
@@ -89,10 +59,8 @@ class Plugin {
   ns: any;
   logger: any;
   ethereum: Ethereum;
-  // Self-contained DNSSEC-validating off-chain resolver (bns
-  // UnboundResolver + private stub zone). Independent of hsd's root server
-  // and its ns.middle hooks, so off-chain recursion never re-enters this
-  // middleware. Null only if its own construction failed.
+  // Self-contained DNSSEC-validating off-chain resolver; see OffchainResolver
+  // for the re-entry rationale. Null only if its own construction failed.
   offchain: OffchainResolver | null;
   activationAbort: AbortController | null = null;
 
@@ -108,9 +76,8 @@ class Plugin {
     try {
       const resolver = new OffchainResolver({
         resolve: async (name, type) => {
-          // Plain HNS root lookup feeding the off-chain mirror. Deliberately
-          // NOT this.ns.middle: nothing in the recursor's path may re-enter
-          // this middleware.
+          // Plain HNS root lookup feeding the off-chain mirror (bypasses
+          // ns.middle; see OffchainResolver).
           const last = util.split(name);
           const tld = util.label(name, last, -1);
           const req = { question: [new wire.Question(name, type)] };
@@ -398,16 +365,21 @@ class Plugin {
     return false;
   }
 
-  // Copy of res with the HIP-5 marker NS records removed. The input comes
-  // from hsd's resolver cache and must not be mutated.
+  // Copy of res — the input comes from hsd's resolver cache and must not
+  // be mutated — with the HIP-5 marker NS records stripped and the pruned
+  // delegation re-signed.
+  // Shared with the off-chain mirror; why the stale NS RRSIG must go (the
+  // referral would be bogus to a validating resolver) is documented beside
+  // pruneHip5Authority in hip5.ts.
   stripHip5(res: any) {
     const out = new wire.Message();
     out.code = res.code;
     out.aa = res.aa;
     out.answer = res.answer.slice();
-    out.authority = res.authority.filter((rr: any) => {
-      return rr.type !== wire.types.NS || hip5Target(rr.data.ns) === null;
-    });
+    out.authority = pruneHip5Authority(
+      res.authority,
+      (nsSet, type) => this.ns.signRRSet(nsSet, type)
+    );
     out.additional = res.additional;
     return out;
   }
