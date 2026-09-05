@@ -50,6 +50,19 @@ function markerRecords(msg: typeof wire.Message.prototype): any[] {
   });
 }
 
+// Same surface as OffchainResolver, without sockets or recursion: prime()
+// captures the priming context, lookup() answers from the canned message.
+function makeOffchainStub(answer: any): any {
+  return {
+    primed: null,
+    prime(tld: string, realNS: any[], referral: any) {
+      this.primed = { tld, realNS, referral };
+    },
+    open: async () => {},
+    lookup: async () => answer
+  };
+}
+
 function setupDualPlugin(node: FakeNode, opts: {
   offchain?: any | null;
   eth?: (name: string, type: number) => Buffer | null;
@@ -57,9 +70,9 @@ function setupDualPlugin(node: FakeNode, opts: {
   const plugin = init(node as any);
   plugin.ready = true;
   (plugin as any).resolveHNS = async () => makeDualReferral();
-  (plugin as any).recursor = opts.offchain === null
+  (plugin as any).offchain = opts.offchain === null
     ? null
-    : { lookup: async () => opts.offchain };
+    : makeOffchainStub(opts.offchain);
   (plugin as any).ethereum.resolveDnsFromEns = opts.eth ?? (async () => null);
   (plugin as any).ethereum.resolveDnsFromAbstractEns = opts.eth ?? (async () => null);
   return plugin;
@@ -97,7 +110,7 @@ describe('handover middleware: dual-mode HIP-5 TLDs', () => {
     question: [new wire.Question(name, type)]
   });
 
-  it('relays off-chain answers from the node recursor untouched without consulting eth', async () => {
+  it('relays off-chain answers untouched without consulting eth', async () => {
     const node = makeNode();
     const answer = new wire.Message();
     answer.code = wire.codes.NOERROR;
@@ -121,20 +134,20 @@ describe('handover middleware: dual-mode HIP-5 TLDs', () => {
     expect(markerRecords(referral).length).toBe(1);
   });
 
-  it('relays genuine off-chain failures (non-NXDOMAIN rcodes) without eth fallback', async () => {
+  it('treats an upstream SERVFAIL as off-chain failure and falls through to eth', async () => {
     const node = makeNode();
-    const servfail = new wire.Message();
-    servfail.code = wire.codes.SERVFAIL;
 
     let ethCalls = 0;
     const plugin = setupDualPlugin(node, {
-      offchain: servfail,
+      offchain: { code: wire.codes.SERVFAIL },
       eth: () => { ethCalls++; return null; }
     });
 
+    // A broken off-chain zone must never mask an on-chain name: the
+    // middleware falls through as if the off-chain attempt never happened.
     const res = await node.ns.middle!('hns.', question(wire.types.A));
-    expect(res.code).toBe(wire.codes.SERVFAIL);
-    expect(ethCalls).toBe(0);
+    expect(ethCalls).toBeGreaterThan(0);
+    expect(markerRecords(res).length).toBe(0);
   });
 
   it('resolves eth-minted names after an off-chain NXDOMAIN', async () => {
@@ -174,71 +187,32 @@ describe('handover middleware: dual-mode HIP-5 TLDs', () => {
     expect(markerRecords(res).length).toBe(0);
   });
 
-  it('serves the re-entering recursor a marker-free referral and terminates (no loop)', async () => {
+  it('asks the off-chain resolver by qname without any priming context', async () => {
     const node = makeNode();
     const answer = new wire.Message();
     answer.code = wire.codes.NOERROR;
-    answer.answer.push(wire.Record.fromJSON({ class: 'IN',
-      name: 'foo.hns.', ttl: 60, type: 'A', data: { address: '1.2.3.4' }
-    }));
 
-    const plugin = setupDualPlugin(node, { offchain: null });
-    let reentry: any = null;
-
-    // The real recursor sends the full qname back to the root stub, which
-    // re-enters the middleware while resolveOffchain is still pending.
-    (plugin as any).recursor = {
-      lookup: async (name: string, type: number) => {
-        reentry = await node.ns.middle!(
-          'hns.',
-          { question: [new wire.Question(name, type)] }
-        );
-
-        // ...then follows the real NS servers and produces an answer.
-        return answer;
-      }
-    };
-
+    const plugin = setupDualPlugin(node, { offchain: answer });
     const res = await node.ns.middle!('hns.', question(wire.types.A));
 
-    expect(reentry).not.toBeNull();
-    expect(reentry.authority.some((rr: any) => rr.type === wire.types.NS)).toBe(true);
-    expect(markerRecords(reentry).length).toBe(0);
-    expect(res.answer.map((rr: any) => rr.type)).toEqual([wire.types.A]);
+    expect(res.code).toBe(wire.codes.NOERROR);
+
+    // Referral sections are no longer handed to the resolver by hand:
+    // the stub derives everything from its own HNS root mirror.
+    const { primed } = (plugin as any).offchain;
+    expect(primed).toBeNull();
   });
 
-  it('recovers the eth fallback after a marker-free re-entry referral', async () => {
+  it('returns null from resolveOffchain when the off-chain resolver explodes', async () => {
     const node = makeNode();
-    const nxdomain = new wire.Message();
-    nxdomain.code = wire.codes.NXDOMAIN;
-
-    const aRecord = encodeRecord({
-      class: 'IN', name: 'foo.hns.', ttl: 60, type: 'A', data: { address: '1.2.3.4' }
-    });
-    const plugin = setupDualPlugin(node, {
-      offchain: nxdomain,
-      eth: (_name, type) => type === wire.types.A ? aRecord : null
-    });
-
-    // Re-enter once the way the real recursor would, before returning the
-    // off-chain negative.
-    (plugin as any).recursor = {
-      lookup: async (name: string, type: number) => {
-        await node.ns.middle!(
-          'hns.',
-          { question: [new wire.Question(name, type)] }
-        );
-        return nxdomain;
-      }
+    const plugin = init(node as any);
+    plugin.ready = true;
+    (plugin as any).offchain = {
+      lookup: async () => { throw new Error('socket exploded'); }
     };
 
-    const res = await node.ns.middle!('hns.', question(wire.types.A));
-    expect(res.answer.length).toBe(1);
-    expect(res.answer[0].type).toBe(wire.types.A);
-    expect(markerRecords(res).length).toBe(0);
-
-    // The in-flight marker must be cleared once the lookup completes.
-    expect((plugin as any).inFlight.size).toBe(0);
+    const out = await (plugin as any).resolveOffchain('foo.hns', wire.types.A);
+    expect(out).toBeNull();
   });
 
   it('keeps the HIP-5 marker visible in NS delegations for on-chain names', async () => {
@@ -277,7 +251,7 @@ describe('handover middleware: dual-mode HIP-5 TLDs', () => {
     expect(markerRecords(referral).length).toBe(1);
   });
 
-  it('falls back to eth-first and strips the marker without a recursor (no-rs)', async () => {
+  it('falls back to eth-first and strips the marker when off-chain resolving is unavailable', async () => {
     const node = makeNode();
     let ethCalls = 0;
     const plugin = setupDualPlugin(node, {
@@ -312,7 +286,7 @@ describe('handover middleware: dual-mode HIP-5 TLDs', () => {
     const plugin = init(node as any);
     plugin.ready = true;
     (plugin as any).resolveHNS = async () => ethOnly;
-    (plugin as any).recursor = { lookup: async () => { throw new Error('no referral'); } };
+    (plugin as any).offchain = makeOffchainStub(null);
     (plugin as any).ethereum.resolveDnsFromEns = async () => null;
 
     // Pure-eth miss: hidden referral, signed negative response.
