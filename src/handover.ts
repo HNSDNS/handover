@@ -2,6 +2,7 @@ import bns from 'bns';
 import { BufferReader } from 'bufio';
 import pRetry from 'p-retry';
 import Ethereum from './ethereum.ts';
+import OffchainResolver from './offchain.ts';
 
 const { wire, util } = bns;
 
@@ -25,10 +26,6 @@ interface HsdNode {
   logger: any;
   config: any;
   chain: any;
-  // Internal recursive resolver surface (lib/dns/server.js
-  // RecursiveServer), used for off-chain resolution of dual-mode HIP-5
-  // TLDs. Optional because hsd only builds it when not run with no-rs.
-  rs?: HsdRecursorServer;
 }
 
 interface HsdQuestion {
@@ -86,33 +83,18 @@ function classifyReferralNS(res: any): { markers: any[]; realNS: any[] } {
   return { markers, realNS };
 }
 
-// Minimal surface of the bns UnboundResolver behind hsd's RecursiveServer
-// (node.rs.hns). Performs DNSSEC-validating off-chain recursion through the
-// real nameservers. Unavailable when hsd runs with no-rs.
-interface Recursor {
-  lookup: (name: string, type: number) => Promise<any>;
-}
-
-// Minimal surface of hsd's RecursiveServer (node.rs).
-interface HsdRecursorServer {
-  hns?: Recursor;
-}
-
 class Plugin {
   ready = false;
   node: HsdNode;
   ns: any;
   logger: any;
   ethereum: Ethereum;
-  recursor: Recursor | null;
+  // Self-contained DNSSEC-validating off-chain resolver (bns
+  // UnboundResolver + private stub zone). Independent of hsd's root server
+  // and its ns.middle hooks, so off-chain recursion never re-enters this
+  // middleware. Null only if its own construction failed.
+  offchain: OffchainResolver | null;
   activationAbort: AbortController | null = null;
-  // Qnames currently being resolved off-chain via the internal recursor.
-  // hsd's recursive resolver sends the full qname to the root (bns does no
-  // wire-level qname minimization), so every off-chain lookup re-enters
-  // this middleware with the identical question it is still processing.
-  // Without tracking that, resolveOffchain -> recursor -> root -> middleware
-  // recurses without bound and every lookup starves behind it.
-  inFlight = new Set<string>();
 
   constructor(node: HsdNode) {
     this.node = node;
@@ -123,7 +105,24 @@ class Plugin {
       rpcUrl: node.config.str('handover-rpc-url')
     });
 
-    this.recursor = node.rs?.hns ?? null;
+    try {
+      const resolver = new OffchainResolver({
+        resolve: async (name, type) => {
+          // Plain HNS root lookup feeding the off-chain mirror. Deliberately
+          // NOT this.ns.middle: nothing in the recursor's path may re-enter
+          // this middleware.
+          const last = util.split(name);
+          const tld = util.label(name, last, -1);
+          const req = { question: [new wire.Question(name, type)] };
+          return this.resolveHNS(req, name, type, `${tld}.`);
+        },
+        sign: (rrset, type) => this.ns.signRRSet(rrset, type)
+      }, this.logger);
+
+      this.offchain = resolver;
+    } catch (e) {
+      this.offchain = null;
+    }
 
     // The plugin cannot operate if the root server isn't enabled
     if (!this.ns) {
@@ -147,19 +146,6 @@ class Plugin {
       const name = qs.name.toLowerCase();
       const type = qs.type;
       const labels = util.split(name);
-
-      // Re-entrant query from the internal recursor (see inFlight): hand it
-      // the plain, marker-free referral so it terminates by following the
-      // real nameservers off-chain. stripHip5 also strips nothing from a
-      // record-free (e.g. cached NXDOMAIN) response.
-      if (this.inFlight.has(name)) {
-        this.logger.debug(
-          'Off-chain re-entry for %s; relaying referral without HIP-5 marker',
-          name
-        );
-        const referral = await this.resolveHNS(req, name, type, tld);
-        return this.stripHip5(referral);
-      }
 
       // The plugin can resolve direct queries for ENS (.eth) names,
       // but we must get the complete query string from the recursive resolver.
@@ -242,15 +228,20 @@ class Plugin {
         const offchain = await this.resolveOffchain(name, type);
 
         if (offchain) {
-          // Relay everything that isn't a definitive negative: answers
-          // (A, CNAME, NS, ...) and genuine upstream failures both carry
-          // more signal than our best guess would. Only NXDOMAIN proves
-          // the name wasn't published off-chain.
-          if (offchain.code !== wire.codes.NXDOMAIN) {
+          // Relay only genuine off-chain answers. SERVFAIL means the
+          // path broke (dead NS, validation failure) — falling through
+          // to the on-chain lookups beats relaying a broken rcode,
+          // otherwise on-chain names would vanish whenever the
+          // off-chain zone misbehaves. Only NXDOMAIN proves the name
+          // wasn't published off-chain.
+          if (offchain.code === wire.codes.SERVFAIL) {
+            // Treat as if the off-chain attempt never happened; the
+            // final fallback below returns the marker-free referral.
+          } else if (offchain.code !== wire.codes.NXDOMAIN) {
             return offchain;
+          } else {
+            offchainNXDOMAIN = offchain;
           }
-
-          offchainNXDOMAIN = offchain;
         }
       }
 
@@ -308,27 +299,25 @@ class Plugin {
     };
   }
 
-  // Full off-chain (real NS) resolution via the node's internal recursive
-  // resolver. Returns null when recursion is unavailable or failed; the
-  // caller then falls back to the on-chain-first upstream behavior.
+  // Full off-chain (real NS) resolution via the plugin's own validating
+  // resolver. Its stub zone mirrors the HNS root (markers pruned,
+  // self-signed), so the recursor reaches the real nameservers without
+  // ever passing through this middleware again. Returns null when
+  // recursion is unavailable or failed; the caller then falls back to the
+  // on-chain upstream behavior, so a dead off-chain path can never mask
+  // an on-chain name.
   async resolveOffchain(name: string, type: number) {
-    if (!this.recursor) {
+    const offchain = this.offchain;
+
+    if (!offchain) {
       return null;
     }
 
-    // Mark the qname in flight before recursing: the recursor reaches the
-    // root again, which re-enters this middleware for the same name (see
-    // the inFlight check at the top of the middleware). This is the only
-    // path from which the middleware can re-enter itself.
-    this.inFlight.add(name);
-
     try {
-      return await this.recursor.lookup(name, type);
+      return await offchain.lookup(name, type);
     } catch (e) {
       this.logResolutionFailure(e, name);
       return null;
-    } finally {
-      this.inFlight.delete(name);
     }
   }
 
@@ -426,6 +415,15 @@ class Plugin {
   async open() {
     this.logger.info('handover external network resolver plugin installed.');
 
+    // Bring the off-chain resolver's sockets up (best effort): if the
+    // machine cannot bind a loopback port, off-chain lookups fail open to
+    // the on-chain path instead of breaking the node.
+    try {
+      await this.offchain?.open();
+    } catch (e) {
+      this.logResolutionFailure(e, 'off-chain resolver');
+    }
+
     // The plugin wants to contact the local Ethereum client (Helios) right
     // when it's opened, but if this hsd instance resolves DNS for the system
     // it runs on, the client may not be reachable yet this early in the hsd
@@ -499,9 +497,10 @@ class Plugin {
     this.logger.debug((e as Error).stack);
   }
 
-  close() {
+  async close() {
     this.ready = false;
     this.stopRetry();
+    await this.offchain?.close();
   }
 
   // Mirrors hsd's server.resolve(): look up a name on HNS normally.
