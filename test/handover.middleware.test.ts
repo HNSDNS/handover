@@ -30,14 +30,22 @@ interface FakeNode {
   chain: object;
 }
 
-function makeNode(): FakeNode {
+// When `debugLog` is given, every logger.debug call is recorded there as
+// its argument list so tests can assert the exact log lines emitted.
+function makeNode(debugLog?: any[][]): FakeNode {
   return {
     ns: {
       signRRSet() {},
       toSOA: () => new wire.Record({ name: '.', type: wire.types.SOA, data: new wire.SOARecord() })
     },
     config: { str: () => DEFAULT_RPC_URL },
-    logger: { context: () => ({ debug() {}, warning() {}, info() {} }) },
+    logger: {
+      context: () => ({
+        debug: (...a: any[]) => { debugLog?.push(a); },
+        warning() {},
+        info() {}
+      })
+    },
     chain: {}
   };
 }
@@ -424,6 +432,75 @@ describe('handover middleware: dual-mode HIP-5 TLDs', () => {
     const hit = await node.ns.middle!('pure.', question(wire.types.A, 'foo.pure'));
     expect(hit.answer.length).toBe(1);
     expect(hit.answer[0].type).toBe(wire.types.A);
+  });
+});
+
+describe('handover middleware: silent-path logging', () => {
+  it('logs exactly one debug line when refusing a pre-activation query', async () => {
+    const logs: any[][] = [];
+    const node = makeNode(logs);
+    // A freshly inited plugin is not yet active — the only state the gate
+    // fires in — so no readiness override here.
+    const plugin = init(node as any);
+    expect(plugin.ready).toBe(false);
+
+    const res = await node.ns.middle!('hns.', question(wire.types.A));
+    expect(res.code).toBe(wire.codes.REFUSED);
+    expect(logs).toEqual([
+      ['Middleware hit while not active, refusing: %s', 'foo.hns.']
+    ]);
+  });
+
+  it('logs the hit line for a successful .eth answer', async () => {
+    const logs: any[][] = [];
+    const node = makeNode(logs);
+    const plugin = makeReadyPlugin(node);
+    const aRec = aRecordBytes('foo.eth.');
+    (plugin as any).ethereum.resolveDnsFromEns = async () => aRec;
+
+    const res = await node.ns.middle!('eth.', question(wire.types.A, 'foo.eth'));
+    expect(res.answer.length).toBe(1);
+    expect(res.answer[0].type).toBe(wire.types.A);
+    // data is wire-encoded, so the log carries the byte length.
+    expect(logs).toEqual([
+      ['ENS lookup: %s %s -> %d byte answer', 'foo.eth.', wire.types.A, aRec.length]
+    ]);
+  });
+
+  it('logs the miss line when the ENS resolver returns nothing', async () => {
+    const logs: any[][] = [];
+    const node = makeNode(logs);
+    const plugin = makeReadyPlugin(node);
+    (plugin as any).ethereum.resolveDnsFromEns = async () => null;
+
+    const res = await node.ns.middle!('eth.', question(wire.types.A, 'foo.eth'));
+    expect(res.answer.length).toBe(0);
+    expect(res.authority.some((rr: any) => rr.type === wire.types.NSEC)).toBe(true);
+    expect(logs).toEqual([
+      ['ENS lookup: %s %s -> miss, returning NODATA', 'foo.eth.', wire.types.A]
+    ]);
+  });
+
+  it('logs the relay line when an off-chain negative becomes the final answer', async () => {
+    const logs: any[][] = [];
+    const node = makeNode(logs);
+    const nxdomain = nxdomainMessage();
+    nxdomain.authority.push(soaRecord('hns.'));
+
+    setupDualPlugin(node, { offchain: nxdomain });
+
+    const res = await node.ns.middle!('hns.', question(wire.types.A));
+    expect(res.code).toBe(wire.codes.NXDOMAIN);
+
+    // The marker intercept also logs; only the relay line must be exact.
+    const relay = logs.find(
+      (a) => a[0] === 'Relaying off-chain negative for %s (rcode %d)'
+    );
+    expect(relay).toEqual([
+      'Relaying off-chain negative for %s (rcode %d)',
+      'foo.hns.',
+      wire.codes.NXDOMAIN
+    ]);
   });
 });
 

@@ -103,6 +103,8 @@ class Plugin {
       if (!this.ready) {
         const res = new wire.Message();
         res.code = wire.codes.REFUSED;
+        // Pre-activation only, so this cannot flood the log under load.
+        this.logger.debug('Middleware hit while not active, refusing: %s', req.question[0].name);
         return res;
       }
 
@@ -129,6 +131,8 @@ class Plugin {
           try {
             data = await this.ethereum.resolveDnsFromEns(name, type);
             if (data && data.length > 0) {
+              // data is wire-encoded, so only its byte length is known here.
+              this.logger.debug('ENS lookup: %s %s -> %d byte answer', name, type, data.length);
               return this.sendData(data, type);
             }
           } catch (e) {
@@ -143,6 +147,7 @@ class Plugin {
             this.logResolutionFailure(e, name);
           }
 
+          this.logger.debug('ENS lookup: %s %s -> miss, returning NODATA', name, type);
           return this.sendSOA(name, tld, type);
         case HIP5_ABSTRACT_DOT:
           return this.sendSOA(name, tld, type);
@@ -294,6 +299,7 @@ class Plugin {
         // Name doesn't exist off-chain and has nothing on-chain either:
         // relay the off-chain zone's NXDOMAIN (honest, validated
         // negative proof).
+        this.logger.debug('Relaying off-chain negative for %s (rcode %d)', name, offchainNXDOMAIN.code);
         return offchainNXDOMAIN;
       }
 
