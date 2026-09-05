@@ -77,6 +77,18 @@ function makeOffchainStub(answer: any): any {
   };
 }
 
+// Root referral for a plain delegation: real nameservers only, zero HIP-5
+// markers — the shape ICANN mirror TLDs (com., it.) and every ordinary HNS
+// TLD present to the middleware.
+function plainReferral(): any {
+  const msg = new wire.Message();
+  msg.code = wire.codes.NOERROR;
+  msg.authority.push(
+    wire.Record.fromJSON({ class: 'IN', name: 'hns.', ttl: 0, type: 'NS', data: { ns: LABEL_NS } })
+  );
+  return msg;
+}
+
 function setupDualPlugin(node: FakeNode, opts: {
   offchain?: any | null;
   eth?: (name: string, type: number) => Buffer | null;
@@ -344,6 +356,36 @@ describe('handover middleware: dual-mode HIP-5 TLDs', () => {
     // The referral carries the marker; the stripped response must not.
     expect(markerRecords(res).length).toBe(0);
     expect(res.authority.some((rr: any) => rr.type === wire.types.NS)).toBe(true);
+  });
+
+  it('passes marker-free referrals through without invoking the off-chain resolver', async () => {
+    const node = makeNode();
+
+    // ICANN-mirror shape: the referral's NS RRset contains only real
+    // nameservers, no HIP-5 markers. The parent recursive resolver must
+    // follow this delegation itself; a full in-process off-chain recursion
+    // would resolve the name twice and its answer was discarded.
+    const referral = plainReferral();
+    const answer = new wire.Message();
+    answer.code = wire.codes.NOERROR;
+    const plugin = makeReadyPlugin(node, {
+      resolveHNS: async () => referral,
+      offchain: makeOffchainStub(answer)
+    });
+    const lookups = plugin.offchain.lookups as { name: string; type: number }[];
+
+    for (const qtype of [wire.types.A, wire.types.NS]) {
+      const res = await node.ns.middle!('hns.', question(qtype));
+
+      // (a) the off-chain resolver was never asked to resolve anything.
+      expect(lookups).toHaveLength(0);
+
+      // (b) the HNS root response is returned unmodified: it is the same
+      // referral object, wire-encoding-wise untouched, real NS included.
+      expect(res.encode().equals(referral.encode())).toBe(true);
+      expect(res.authority.some((rr: any) => rr.data.ns === LABEL_NS)).toBe(true);
+      expect(markerRecords(res).length).toBe(0);
+    }
   });
 
   it('serves the bare TLD NS referral with the HIP-5 marker intact', async () => {
