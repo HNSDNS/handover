@@ -25,6 +25,29 @@ export const ZERO_ADDRESS: Address = '0x0000000000000000000000000000000000000000
 export const DEFAULT_RPC_URL = 'http://127.0.0.1:8545';
 const CACHE_TTL = 30 * 60 * 1000;
 
+// A dead RPC (helios down/restarting) must not hang queries on viem's
+// defaults (10s timeout x 4 attempts per call). Every call gets a hard
+// 2s budget and no transport-level retries; a failed call additionally
+// puts the instance into a short unhealthy cooldown so subsequent
+// Ethereum-bound queries fail fast with zero RPC attempts instead of
+// queueing behind more doomed timeouts.
+export const RPC_TIMEOUT_MS = 2000;
+export const UNHEALTHY_COOLDOWN_MS = 5000;
+
+// Thrown by the health gate instead of attempting the RPC while the
+// instance is in its unhealthy cooldown. The middleware answers this
+// with SERVFAIL (never a cacheable negative), so recursive resolvers
+// retry quickly once the RPC recovers.
+export class EthereumUnhealthyError extends Error {
+  cause: unknown;
+
+  constructor(message: string, cause: unknown) {
+    super(message);
+    this.name = 'EthereumUnhealthyError';
+    this.cause = cause;
+  }
+}
+
 // ENS root TLD sentinel: its node's official resolver must never be used to
 // answer for arbitrary *.eth names (it has no wildcard resolver). Derived
 // from the shared HIP-5 definition so the sentinel can't drift from the zone
@@ -282,6 +305,8 @@ export interface EthereumOptions {
   rpcUrl?: string;
   /** View call client (for testing). */
   client?: any;
+  /** Clock for the unhealthy cooldown (for testing). */
+  now?: () => number;
 }
 
 export default class Ethereum {
@@ -291,13 +316,20 @@ export default class Ethereum {
   ensRegistry: any;
   ensResolver: any = null;
   cache: EthereumCache;
+  private healthy = true;
+  private unhealthyUntil = 0;
+  private now: () => number;
 
   constructor(options: EthereumOptions = {}) {
     this.rpcUrl = options.rpcUrl || DEFAULT_RPC_URL;
+    this.now = options.now || Date.now;
 
     this.client = options.client || createPublicClient({
       chain: mainnet,
-      transport: http(this.rpcUrl)
+      transport: http(this.rpcUrl, {
+        timeout: RPC_TIMEOUT_MS,
+        retryCount: 0
+      })
     });
 
     this.ensRegistry = getContract({
@@ -310,6 +342,55 @@ export default class Ethereum {
 
   async init() {
     this.ensResolver = await this.getEnsResolver(ETH_TLD);
+  }
+
+  // True unless a failed RPC call opened the unhealthy cooldown and it has
+  // not expired yet. The flag self-clears once the cooldown passes so the
+  // next query gets a real RPC attempt instead of a permanent shortcut.
+  isHealthy(): boolean {
+    if (this.healthy) {
+      return true;
+    }
+
+    if (this.now() >= this.unhealthyUntil) {
+      this.healthy = true;
+      return true;
+    }
+
+    return false;
+  }
+
+  markSuccess(): void {
+    this.healthy = true;
+    this.unhealthyUntil = 0;
+  }
+
+  private markFailure(): void {
+    this.healthy = false;
+    this.unhealthyUntil = this.now() + UNHEALTHY_COOLDOWN_MS;
+  }
+
+  // Gate for every top-level RPC-calling entry point. While unhealthy it
+  // throws immediately (zero RPC attempt); otherwise it runs the operation
+  // and judges the RPC healthy or not by the outcome. Inner helpers must
+  // NOT be wrapped too: a single public entry wraps its whole subtree so
+  // one query counts as one RPC outcome.
+  private async withHealth<T>(op: () => Promise<T>): Promise<T> {
+    if (!this.isHealthy()) {
+      throw new EthereumUnhealthyError(
+        'Ethereum RPC is unhealthy; failing fast during cooldown',
+        null
+      );
+    }
+
+    try {
+      const result = await op();
+      this.markSuccess();
+      return result;
+    } catch (e) {
+      this.markFailure();
+      throw e;
+    }
   }
 
   async getEnsResolver(name: string): Promise<any> {
@@ -402,21 +483,23 @@ export default class Ethereum {
       }
     }
 
-    const node = this.namehash(name);
-    const resolverAddress = await this.#nodeResolverAddress(node);
+    return this.withHealth(async (): Promise<Address | null> => {
+      const node = this.namehash(name);
+      const resolverAddress = await this.#nodeResolverAddress(node);
 
-    if (!resolverAddress) {
-      return null;
-    }
+      if (!resolverAddress) {
+        return null;
+      }
 
-    // registry/addr call errors propagate (throw), like ethers 5.0.x, which
-    // had no try/catch on either call.
-    const result = (await this.client.call({
-      address: resolverAddress as Address,
-      data: concat([ADDR_SELECTOR, node])
-    })) as Hex;
+      // registry/addr call errors propagate (throw), like ethers 5.0.x, which
+      // had no try/catch on either call.
+      const result = (await this.client.call({
+        address: resolverAddress as Address,
+        data: concat([ADDR_SELECTOR, node])
+      })) as Hex;
 
-    return parseAddressWord(result);
+      return parseAddressWord(result);
+    });
   }
 
   async resolveEnsText(name: string, key: string): Promise<string | null> {
@@ -428,31 +511,33 @@ export default class Ethereum {
     // ethers' toUtf8Bytes which read `.length` and found none.
     key = typeof key === 'string' ? key : '';
 
-    const node = this.namehash(name);
-    const resolverAddress = await this.#nodeResolverAddress(node);
+    return this.withHealth(async (): Promise<string | null> => {
+      const node = this.namehash(name);
+      const resolverAddress = await this.#nodeResolverAddress(node);
 
-    if (!resolverAddress) {
-      return null;
-    }
+      if (!resolverAddress) {
+        return null;
+      }
 
-    // like ethers 5.0.x, call errors propagate (throw); only an empty result
-    // maps to null.
-    const result = (await this.client.call({
-      address: resolverAddress as Address,
-      data: concat([TEXT_SELECTOR, node, encodeTextKey(key)])
-    })) as Hex;
+      // like ethers 5.0.x, call errors propagate (throw); only an empty result
+      // maps to null.
+      const result = (await this.client.call({
+        address: resolverAddress as Address,
+        data: concat([TEXT_SELECTOR, node, encodeTextKey(key)])
+      })) as Hex;
 
-    if (!result || result === '0x') {
-      return null;
-    }
+      if (!result || result === '0x') {
+        return null;
+      }
 
-    const text = decodeAbiParameters([{ type: 'string' }], result)[0];
+      const text = decodeAbiParameters([{ type: 'string' }], result)[0];
 
-    // an on-chain empty string reads back as null, matching ethers' getText.
-    // (A hostile resolver returning invalid UTF-8 would yield U+FFFD via the
-    // lenient decoder here where ethers' toUtf8String threw; not reachable via
-    // the middleware.)
-    return text === '' ? null : text;
+      // an on-chain empty string reads back as null, matching ethers' getText.
+      // (A hostile resolver returning invalid UTF-8 would yield U+FFFD via the
+      // lenient decoder here where ethers' toUtf8String threw; not reachable via
+      // the middleware.)
+      return text === '' ? null : text;
+    });
   }
 
   async resolveDnsFromEns(
@@ -462,7 +547,9 @@ export default class Ethereum {
   ): Promise<Buffer | null> {
     // The canonical ENS registry is an ordinary registry address; route
     // through the shared caching resolver path.
-    return this.resolveDnsFromRegistry(name, type, ENS_ADDRESS, node);
+    return this.withHealth(() =>
+      this.resolveDnsFromRegistry(name, type, ENS_ADDRESS, node)
+    );
   }
 
   async getRRSet(
@@ -587,7 +674,9 @@ export default class Ethereum {
       return null;
     }
 
-    return this.resolveDnsFromRegistry(name, type, addr, node);
+    return this.withHealth(() =>
+      this.resolveDnsFromRegistry(name, type, addr, node)
+    );
   }
 
   async resolveDnsFromRegistry(
