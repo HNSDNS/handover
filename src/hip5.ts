@@ -19,6 +19,20 @@ export const HIP5_ZONES = {
 export const HIP5_ZONE_DOT = HIP5_ZONES.ETH + '.';
 export const HIP5_ABSTRACT_DOT = HIP5_ZONES.ABSTRACT + '.';
 
+// Probe qname: '<name> prefixed with the 'resolver' label, e.g.
+// resolver.<name>. TXT. The middleware intercepts it before any resolution
+// and answers with 'resolver=ens|hns|dns' telling a downstream service
+// which system handover's routing would resolve <name> from — 'ens'
+// (on-chain ENS/EIP-1185), 'hns' (delegated in the Handshake root zone,
+// mirrors and dual-mode names included) or 'dns' (not in Handshake at all;
+// the recursor falls back to ICANN DNS). No special delegation is needed:
+// the probe is just an ordinary name under a TLD the middleware already
+// sees before it resolves anything.
+export const HIP5_PROBE_LABEL = 'resolver';
+export const HIP5_PROBE_SOURCE_ENS = 'ens';
+export const HIP5_PROBE_SOURCE_HNS = 'hns';
+export const HIP5_PROBE_SOURCE_DNS = 'dns';
+
 function isHip5Zone(value: string): value is Hip5Zone {
   return value === HIP5_ZONES.ETH || value === HIP5_ZONES.ABSTRACT;
 }

@@ -2,12 +2,21 @@ import bns from 'bns';
 import { BufferReader } from 'bufio';
 import pRetry from 'p-retry';
 import Ethereum, { EthereumUnhealthyError } from './ethereum.ts';
-import { HIP5_ZONES, HIP5_ZONE_DOT, HIP5_ABSTRACT_DOT, hip5Target, isHip5NS, pruneHip5Authority } from './hip5.ts';
+import {
+  HIP5_ZONES, HIP5_ZONE_DOT, HIP5_ABSTRACT_DOT,
+  hip5Target, isHip5NS, pruneHip5Authority,
+  HIP5_PROBE_LABEL, HIP5_PROBE_SOURCE_ENS, HIP5_PROBE_SOURCE_HNS, HIP5_PROBE_SOURCE_DNS
+} from './hip5.ts';
 import OffchainResolver from './offchain.ts';
 
 const { wire, util } = bns;
 
 const TYPE_MAP_EMPTY = Buffer.from('0006000000000003', 'hex');
+
+// Probe answers must re-check quickly: the reported system can flip the
+// moment a name gets minted on- or off-chain, so don't let recursive
+// resolvers pin the answer for long.
+const PROBE_TXT_TTL = 5 * 60;
 
 // Helios may reject state-proofs for minutes after it starts ("distance to
 // target block exceeds maximum proof window"), so keep retrying activation
@@ -115,6 +124,25 @@ class Plugin {
       const name = qs.name.toLowerCase();
       const type = qs.type;
       const labels = util.split(name);
+
+      // Probe queries, intercepted before any resolution: TXT for
+      // 'resolver.<name>.' gets a single TXT 'resolver=ens|hns|dns'
+      // describing which system this resolver's routing would serve
+      // <name> from, computed from the same classification the normal
+      // path below performs (classifyReferralNS + isMintedOnChain).
+      // Downstream services just send the query; no marker or referral
+      // parsing on their side.
+      if (labels.length >= 2 && name.startsWith(`${HIP5_PROBE_LABEL}.`)) {
+        try {
+          return await this.sendProbe(name, type);
+        } catch (e) {
+          if (e instanceof EthereumUnhealthyError) {
+            return this.sendServfail();
+          }
+
+          throw e;
+        }
+      }
 
       // The plugin can resolve direct queries for ENS (.eth) names,
       // but we must get the complete query string from the recursive resolver.
@@ -414,6 +442,81 @@ class Plugin {
     }
 
     return false;
+  }
+
+  // Answer a 'resolver.<name>.' probe (see the middleware hook above).
+  // Sends the routing decision for the target name — the probe name minus
+  // the leading 'resolver' label — as a single TXT record.
+  // EthereumUnhealthyError propagates to the middleware wrapper, which
+  // turns it into a non-cacheable SERVFAIL.
+  async sendProbe(name: string, type: number) {
+    const target = name.slice(HIP5_PROBE_LABEL.length + 1);
+    const targetTLD = `${util.label(target, util.split(target), -1)}.`;
+
+    if (type !== wire.types.TXT) {
+      return this.sendSOA(name, targetTLD, type);
+    }
+
+    // The whole .eth zone is answered on-chain without consulting the
+    // root zone, so the decision is static.
+    if (targetTLD === HIP5_ZONE_DOT) {
+      return this.sendProbeTXT(name, HIP5_PROBE_SOURCE_ENS);
+    }
+
+    // Mirror the exact referral shape the routing below uses: an NS-type
+    // root lookup (same synthetic persist the DS->NS rewrite builds), so
+    // probe and real resolution can never disagree on dual-mode state.
+    const referral = await this.resolveHNS({
+      question: [
+        new wire.Question(target, wire.types.NS)
+      ]
+    }, target, wire.types.NS, targetTLD);
+
+    if (!referral.authority.length) {
+      // No delegation in the Handshake root zone: the recursor falls
+      // through to ordinary ICANN DNS.
+      return this.sendProbeTXT(name, HIP5_PROBE_SOURCE_DNS);
+    }
+
+    const { markers } = classifyReferralNS(referral);
+
+    if (markers.length === 0) {
+      // Plain delegation — a minted HNS TLD or an ICANN mirror (the
+      // root zone carries those too): the answer comes from the
+      // Handshake root zone's delegation data.
+      return this.sendProbeTXT(name, HIP5_PROBE_SOURCE_HNS);
+    }
+
+    // Dual-mode or pure HIP-5 TLD: report on-chain only when the name
+    // is actually resolvable through the marker, exactly like the NS
+    // referral decision below.
+    const mintedOnChain = await this.isMintedOnChain(target, markers);
+
+    return this.sendProbeTXT(
+      name,
+      mintedOnChain ? HIP5_PROBE_SOURCE_ENS : HIP5_PROBE_SOURCE_HNS
+    );
+  }
+
+  // Authoritative probe answer: one signed TXT directly in the answer
+  // section, mirroring the sendData answer-shape convention.
+  sendProbeTXT(name: string, source: string) {
+    const res = new wire.Message();
+    res.aa = true;
+
+    const rr = new wire.Record();
+    rr.name = util.fqdn(name);
+    rr.type = wire.types.TXT;
+    rr.ttl = PROBE_TXT_TTL;
+
+    const rd = new wire.TXTRecord();
+    rd.txt = [`resolver=${source}`];
+    rr.data = rd;
+
+    res.answer.push(rr);
+    this.ns.signRRSet(res.answer, wire.types.TXT);
+
+    return res;
   }
 
   // Copy of res — the input comes from hsd's resolver cache and must not
