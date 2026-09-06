@@ -76,6 +76,22 @@ export function aRecordBytes(name: string, address: string = GLUE_ADDR, ttl = 60
   return aRecord(name, address, ttl).encode();
 }
 
+// Wire-encoded TLSA (DANE) record, as the middleware's eth side returns it
+// for EIP-1185 datasets. A DANE service query is a '_<port>._tcp.' label
+// prefix on a hostname — e.g. the TLSA for the host svc.hns (TLD hns) is
+// '_443._tcp.svc.hns.' Fixtures use the test-only 'svc' host under the hns
+// TLD so no real domain is referenced.
+export function tlsaRecord(name = '_443._tcp.svc.hns.', ttl = 3600): any {
+  return wire.Record.fromJSON({
+    class: 'IN', name, ttl, type: 'TLSA',
+    data: { usage: 3, selector: 1, matchingType: 1, certificate: '0123456789abcdef' }
+  });
+}
+
+export function tlsaRecordBytes(name = '_443._tcp.svc.hns.', ttl = 3600): Buffer {
+  return tlsaRecord(name, ttl).encode();
+}
+
 // Convenience for tests that need both the instance and its mock client,
 // without pre-creating the mock themselves.
 export function makeEthWithMock(): [Ethereum, MockClient] {

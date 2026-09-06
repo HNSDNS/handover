@@ -14,7 +14,9 @@ import {
   question,
   signedDualReferral,
   soaRecord,
-  STALE_ROOT_SIG
+  STALE_ROOT_SIG,
+  tlsaRecord,
+  tlsaRecordBytes
 } from './helpers.ts';
 
 const { wire } = bns;
@@ -704,5 +706,74 @@ describe('handover middleware: resolver.<name> probe', () => {
 
     // Non-cacheable: recursive resolvers must re-probe once the RPC recovers.
     expect(res.code).toBe(wire.codes.SERVFAIL);
+  });
+});
+
+describe('handover middleware: TLSA records', () => {
+  // DANE service query: a '_443._tcp.' label prefix on a hostname under the
+  // hns TLD (svc.hns). The leading '_<port>._tcp.' labels are ordinary qname
+  // labels — nothing in this middleware special-cases them, so the referral,
+  // off-chain and on-chain branches must handle a TLSA question exactly like
+  // any other type.
+  const TLSA_NAME = '_443._tcp.svc.hns.';
+
+  it('relays an off-chain TLSA answer untouched without consulting eth', async () => {
+    const node = makeNode();
+    const answer = new wire.Message();
+    answer.code = wire.codes.NOERROR;
+    answer.answer.push(tlsaRecord());
+
+    let ethCalls = 0;
+    const plugin = setupDualPlugin(node, {
+      offchain: answer,
+      eth: () => { ethCalls++; return null; }
+    });
+
+    const res = await node.ns.middle!('hns.', question(wire.types.TLSA, TLSA_NAME));
+
+    // A dual-mode TLD resolves off-chain first; the TLSA RRset comes back
+    // exactly as the recursor produced it, eth never consulted.
+    expect(res.code).toBe(wire.codes.NOERROR);
+    expect(res.answer.map((rr: any) => rr.type)).toEqual([wire.types.TLSA]);
+    expect(res.answer[0].data.usage).toBe(3);
+    expect(res.answer[0].name).toBe('_443._tcp.svc.hns.');
+    expect(ethCalls).toBe(0);
+  });
+
+  it('injects an on-chain TLSA answer after the off-chain NXDOMAIN', async () => {
+    const node = makeNode();
+    const nxdomain = nxdomainMessage();
+    const tlsa = tlsaRecordBytes(TLSA_NAME);
+
+    const plugin = setupDualPlugin(node, {
+      offchain: nxdomain,
+      eth: (_name, type) => type === wire.types.TLSA ? tlsa : null
+    });
+
+    const res = await node.ns.middle!('hns.', question(wire.types.TLSA, TLSA_NAME));
+
+    // The HIP-5 (EIP-1185) marker path resolves the name on-chain; sendData
+    // places the TLSA record in the authoritative answer section.
+    expect(res.aa).toBe(true);
+    expect(res.answer.map((rr: any) => rr.type)).toEqual([wire.types.TLSA]);
+    expect(res.answer[0].data.certificate.toString('hex')).toBe('0123456789abcdef');
+  });
+
+  it('answers a direct .eth TLSA query authoritatively', async () => {
+    const node = makeNode();
+    const plugin = makeReadyPlugin(node);
+    const tlsa = tlsaRecordBytes('_443._tcp.svc.eth.');
+
+    (plugin as any).ethereum.resolveDnsFromEns = async () => tlsa;
+
+    const res = await node.ns.middle!(
+      'eth.',
+      question(wire.types.TLSA, '_443._tcp.svc.eth.')
+    );
+
+    // The whole .eth zone is served from the ENS resolver; a TLSA qtype is
+    // an authoritative answer, not a referral.
+    expect(res.aa).toBe(true);
+    expect(res.answer.map((rr: any) => rr.type)).toEqual([wire.types.TLSA]);
   });
 });
