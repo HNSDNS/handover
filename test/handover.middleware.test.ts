@@ -1,7 +1,7 @@
 import { describe, it, expect, vi } from 'vitest';
 import bns from 'bns';
 import { init } from '../src/handover.ts';
-import { DEFAULT_RPC_URL } from '../src/ethereum.ts';
+import { EthereumUnhealthyError, DEFAULT_RPC_URL } from '../src/ethereum.ts';
 import {
   aRecord,
   aRecordBytes,
@@ -557,5 +557,152 @@ describe('handover plugin activation retry', () => {
 
     plugin.close();
     vi.useRealTimers();
+  });
+});
+
+describe('handover middleware: resolver.<name> probe', () => {
+  // Fire a probe for the given target name as the middleware would receive
+  // it: the probe is just an ordinary name — 'resolver' label prefixed to
+  // the target — under the target's own TLD.
+  async function probe(node: FakeNode, target = 'foo.hns.', type = wire.types.TXT): Promise<any> {
+    return node.ns.middle!(
+      `${target.slice(0, -1).split('.').pop()}.`,
+      question(type, `resolver.${target.slice(0, -1)}.`)
+    );
+  }
+
+  // Single-string TXT payload the probe answers carry.
+  function probeTXT(res: any): string {
+    expect(res.aa).toBe(true);
+    expect(res.answer.length).toBe(1);
+    const rr = res.answer[0];
+    expect(rr.type).toBe(wire.types.TXT);
+    return rr.data.txt.map((s: any) => String(s)).join('');
+  }
+
+  it('reports ens for a direct .eth name without consulting the root zone', async () => {
+    const node = makeNode();
+
+    const plugin = makeReadyPlugin(node, {
+      resolveHNS: vi.fn(async () => new wire.Message())
+    });
+    (plugin as any).ethereum.resolveDnsFromEns = vi.fn(async () => null);
+
+    const res = await probe(node, 'foo.eth.');
+
+    expect(probeTXT(res)).toBe('resolver=ens');
+    expect(plugin.resolveHNS).not.toHaveBeenCalled();
+    expect(plugin.ethereum.resolveDnsFromEns).not.toHaveBeenCalled();
+  });
+
+  it('reports ens for an on-chain name under a dual-mode TLD', async () => {
+    const node = makeNode();
+    const aRec = aRecordBytes('name.hns.');
+
+    const plugin = setupDualPlugin(node, {
+      eth: (_name, type) => type === wire.types.A ? aRec : null
+    });
+    (plugin as any).resolveHNS = vi.fn((plugin as any).resolveHNS);
+
+    const res = await probe(node, 'name.hns.');
+
+    expect(probeTXT(res)).toBe('resolver=ens');
+    // Decision is the isMintedOnChain A/CNAME probe through the referral
+    // marker, exactly like the routing below.
+    expect(plugin.resolveHNS).toHaveBeenCalledTimes(1);
+    // sendProbe hands the target to the root lookup as a normal name,
+    // matching how the rest of the middleware passes names around.
+    expect((plugin.resolveHNS as any).mock.calls[0][1]).toBe('name.hns.');
+    expect((plugin.resolveHNS as any).mock.calls[0][2]).toBe(wire.types.NS);
+  });
+
+  it('reports hns for an off-chain name under a dual-mode TLD', async () => {
+    const node = makeNode();
+
+    const plugin = setupDualPlugin(node, {
+      eth: () => null
+    });
+
+    const res = await probe(node, 'name.hns.');
+
+    expect(probeTXT(res)).toBe('resolver=hns');
+    // The probe must not go near the off-chain resolver: determinism is the
+    // point, the marker + mint probe alone decide.
+    expect(plugin.offchain.lookups.length).toBe(0);
+  });
+
+  it('reports hns for a marker-free delegation (minted TLD or ICANN mirror)', async () => {
+    const node = makeNode();
+
+    const plugin = makeReadyPlugin(node, {
+      resolveHNS: async () => plainReferral()
+    });
+    (plugin as any).ethereum.resolveDnsFromEns = vi.fn(async () => null);
+    (plugin as any).ethereum.resolveDnsFromAbstractEns = vi.fn(async () => null);
+
+    const res = await probe(node, 'name.com.');
+
+    expect(probeTXT(res)).toBe('resolver=hns');
+    expect(plugin.ethereum.resolveDnsFromEns).not.toHaveBeenCalled();
+  });
+
+  it('reports dns when the Handshake root zone has no delegation', async () => {
+    const node = makeNode();
+
+    const plugin = makeReadyPlugin(node, {
+      resolveHNS: async () => nxdomainMessage()
+    });
+
+    const res = await probe(node, 'nope.notreal.');
+
+    expect(probeTXT(res)).toBe('resolver=dns');
+  });
+
+  it('answers non-TXT probes with a NODATA negative', async () => {
+    const node = makeNode();
+
+    const plugin = makeReadyPlugin(node, {
+      resolveHNS: vi.fn(async () => new wire.Message())
+    });
+    (plugin as any).ethereum.resolveDnsFromEns = vi.fn(async () => null);
+
+    const res = await probe(node, 'foo.eth.', wire.types.A);
+
+    expect(res.aa).toBe(true);
+    expect(res.answer.length).toBe(0);
+    expect(plugin.ethereum.resolveDnsFromEns).not.toHaveBeenCalled();
+  });
+
+  it('does not treat the bare "resolver." name (or non-probe names) as a probe', async () => {
+    const node = makeNode();
+
+    const plugin = makeReadyPlugin(node, {
+      resolveHNS: vi.fn(async () => new wire.Message())
+    });
+
+    // No reserved TLD exists: a single-label "resolver." falls through to
+    // the normal root-zone path instead of probe interception.
+    for (const name of ['resolver.', 'resolverfoo.hns.', 'x.resolverfoo.hns.']) {
+      const req = { question: [new wire.Question(name, wire.types.TXT)] };
+      await node.ns.middle!('resolver.', req);
+    }
+
+    expect(plugin.resolveHNS).toHaveBeenCalled();
+  });
+
+  it('answers SERVFAIL when Ethereum is unhealthy during the mint probe', async () => {
+    const node = makeNode();
+
+    const plugin: any = setupDualPlugin(node, {
+      offchain: null,
+      eth: () => {
+        throw new EthereumUnhealthyError('helios down', new Error('helios down'));
+      }
+    });
+
+    const res = await probe(node, 'name.hns.');
+
+    // Non-cacheable: recursive resolvers must re-probe once the RPC recovers.
+    expect(res.code).toBe(wire.codes.SERVFAIL);
   });
 });

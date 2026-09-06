@@ -175,6 +175,35 @@ The `_eth` TLD indicates an abstract (forked) ENS contract on Ethereum, appended
 to the contract's address. On Ethereum, the domain `certified.badass` was registered
 with this contract, and its DNS records were set using [EIP-1185](https://eips.ethereum.org/EIPS/eip-1185).
 
+## Resolution-source probe
+
+Downstream services can ask this resolver directly which system a name would be
+resolved from, without replicating Handshake's HIP-5 marker semantics:
+
+```
+$ dig +short -t TXT resolver.neon.hns
+"resolver=hns"
+```
+
+Querying `resolver.<name>.` for `TXT` returns a single record:
+
+| Answer | Meaning |
+|---|---|
+| `resolver=ens` | answered from Ethereum (ENS / EIP-1185), either a direct `.eth` query or a name minted on-chain under a HIP-5 TLD |
+| `resolver=hns` | answered via the Handshake root zone's delegation (minted HNS TLDs, ICANN mirror TLDs, and dual-mode TLD names not minted on-chain) |
+| `resolver=dns` | the name is not minted in Handshake at all; an ordinary recursive resolver falls back to ICANN DNS |
+
+The answer is authoritative (`AA=1`) and computed with the exact same decision
+logic the routing itself uses (HIP-5 marker classification plus an on-chain
+mint probe). It is therefore deterministic and unaffected by marker-hiding or
+relay semantics: no NS or CNAME records need to be parsed by the requester.
+If Ethereum is unhealthy during the on-chain probe, the query is answered with
+`SERVFAIL` (non-cacheable) rather than a misleading negative.
+
+The probe is intercepted by the middleware before any resolution takes
+place: `resolver.<name>.` is an ordinary query — no delegation or marker
+semantics involved on either side.
+
 ## Explanation
 
 When `hsd` is run with this plugin, a middleware function is added to the HNS root
